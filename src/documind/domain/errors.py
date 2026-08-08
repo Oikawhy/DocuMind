@@ -137,3 +137,21 @@ class SecretRetrievalError(DomainError):
 
     def __init__(self, message: str = "Secret retrieval failed.") -> None:
         super().__init__(message, code="DEPENDENCY_UNAVAILABLE")
+
+
+class ChatDisabledError(DomainError):
+    """Chat is disabled by configuration (HTTP 403)."""
+
+    code = "CHAT_DISABLED"
+
+    def __init__(self, message: str = "Chat is disabled.") -> None:
+        super().__init__(message, code="CHAT_DISABLED")
+
+
+class SSRFViolationError(DomainError):
+    """Webhook target URL failed SSRF validation (HTTP 400)."""
+
+    code = "SSRF_VIOLATION"
+
+    def __init__(self, message: str = "The webhook target URL is not permitted.") -> None:
+        super().__init__(message, code="SSRF_VIOLATION")

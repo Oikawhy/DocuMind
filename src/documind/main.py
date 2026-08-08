@@ -13,6 +13,7 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 
+from documind.api.chat import router as chat_router
 from documind.api.documents import router as documents_router
 from documind.api.health import router as health_router
 from documind.api.identity import router as identity_router
@@ -20,6 +21,7 @@ from documind.api.middleware import oidc_middleware
 from documind.api.operations import router as operations_router
 from documind.api.retrieval import router as retrieval_router
 from documind.api.versions import router as versions_router
+from documind.api.webhooks import router as webhooks_router
 from documind.api.scim import router as scim_router
 from documind.config import settings
 from documind.database import AsyncSessionLocal
@@ -29,6 +31,7 @@ from documind.domain.policy_service import PolicyService
 from documind.schemas.common import validation_error_response
 from documind.services.audit_service import AuditService
 from documind.services.identity_service import IdentityService
+from documind.services.webhook_service import WebhookService
 
 
 def configure_logging() -> None:
@@ -62,6 +65,7 @@ async def request_validation_error(request: Request, exc: RequestValidationError
 # Service wiring — attach to app.state for route-handler access
 # ---------------------------------------------------------------------------
 app.state.session_factory = AsyncSessionLocal
+app.state.settings = settings
 
 # Audit service (hash-chain writer).
 app.state.audit_service = AuditService(session_factory=AsyncSessionLocal)
@@ -94,6 +98,15 @@ app.state.document_service = None
 # Retrieval service is wired during startup when projection stores are ready.
 app.state.retrieval_service = None
 
+# RAG service is wired during startup when the full LangGraph pipeline is ready.
+app.state.rag_service = None
+
+# LLM service is wired during startup when model routes are configured.
+app.state.llm_service = None
+
+# Webhook service for delivery and SSRF-safe registration.
+app.state.webhook_service = WebhookService(session_factory=AsyncSessionLocal)
+
 # ---------------------------------------------------------------------------
 # Middleware — OIDC fail-closed authentication
 # ---------------------------------------------------------------------------
@@ -115,3 +128,6 @@ app.include_router(documents_router)
 app.include_router(operations_router)
 app.include_router(retrieval_router)
 app.include_router(versions_router)
+app.include_router(chat_router)
+app.include_router(webhooks_router)
+

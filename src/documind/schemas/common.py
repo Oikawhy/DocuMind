@@ -13,12 +13,14 @@ from pydantic import BaseModel, Field
 from documind.domain.errors import (
     AuthenticationError,
     AuthorizationDeniedError,
+    ChatDisabledError,
     ChunkProfileValidationError,
     DomainError,
     LabelValidationError,
     PolicyUnavailableError,
     ResourceConflictError,
     ResourceNotFoundError,
+    SSRFViolationError,
     UploadTooLargeError,
 )
 
@@ -59,6 +61,8 @@ def error_response(request: Request, error: DomainError) -> JSONResponse:
     status = 400
     if isinstance(error, (AuthenticationError,)):
         status = 401
+    elif isinstance(error, ChatDisabledError):
+        status = 403
     elif isinstance(error, AuthorizationDeniedError):
         status = 404 if error.use_404 else 403
     elif isinstance(error, ResourceNotFoundError):
@@ -69,6 +73,8 @@ def error_response(request: Request, error: DomainError) -> JSONResponse:
         status = 413
     elif isinstance(error, (LabelValidationError, ChunkProfileValidationError)):
         status = 422
+    elif isinstance(error, SSRFViolationError):
+        status = 400
     elif isinstance(error, PolicyUnavailableError) or error.code in {
         "AUTHORIZATION_UNAVAILABLE",
         "DEPENDENCY_UNAVAILABLE",
