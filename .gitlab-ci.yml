@@ -1,0 +1,129 @@
+stages:
+  - lint
+  - test
+  - build
+  - sign
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+default:
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm@sha256:85d4cb1afa769a7338e095b927bee941cf5ec92266c7424b3f6c0f2748567248
+  interruptible: true
+
+cache:
+  key:
+    files: [uv.lock]
+  paths:
+    - .cache/uv
+
+lint:
+  stage: lint
+  script:
+    - uv sync --frozen --extra dev
+    - uv run ruff check src tests
+    - uv run ruff format --check src tests
+
+compose-validate:
+  stage: lint
+  image: docker@sha256:328eb399a065780c2cebe9224de003aa14084cf69efae882ac27430f921819b7
+  services:
+    - name: docker@sha256:6ca9a6811085e2cf769cbac04bc47daf66629102990391caab7cf37426e939da
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - ./scripts/generate-compose-secrets
+    - docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+
+test:
+  stage: test
+  services:
+    - name: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+      alias: postgres
+      variables:
+        POSTGRES_DB: documind_test
+        POSTGRES_USER: "$CI_TEST_POSTGRES_USER"
+        POSTGRES_PASSWORD: "$CI_TEST_POSTGRES_PASSWORD"
+    - name: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+      alias: redis
+      command: ["/bin/sh", "-ec", "exec redis-server --requirepass \"$CI_TEST_REDIS_PASSWORD\""]
+  variables:
+    DOCUMIND_DATABASE_URL_REF: openbao://secret/data/documind/ci-database#url
+    DOCUMIND_REDIS_URL_REF: openbao://secret/data/documind/ci-redis#url
+    DOCUMIND_REDIS_STREAMS_URL_REF: openbao://secret/data/documind/ci-redis#streams_url
+  script:
+    - test -n "$CI_TEST_POSTGRES_USER"
+    - test -n "$CI_TEST_POSTGRES_PASSWORD"
+    - test -n "$CI_TEST_REDIS_PASSWORD"
+    - uv sync --frozen --extra dev
+    - uv run pytest -v
+
+build:
+  stage: build
+  image: docker@sha256:328eb399a065780c2cebe9224de003aa14084cf69efae882ac27430f921819b7
+  services:
+    - name: docker@sha256:6ca9a6811085e2cf769cbac04bc47daf66629102990391caab7cf37426e939da
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - test -n "$CI_REGISTRY_IMAGE"
+    - echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build --pull --tag "$CI_REGISTRY_IMAGE/api:$CI_COMMIT_SHA" .
+    - docker build --pull --file Dockerfile.worker --tag "$CI_REGISTRY_IMAGE/worker:$CI_COMMIT_SHA" .
+    - docker build --pull --file Dockerfile.console --tag "$CI_REGISTRY_IMAGE/console:$CI_COMMIT_SHA" .
+    - docker build --pull --file Dockerfile.clamav --tag "$CI_REGISTRY_IMAGE/scanner:$CI_COMMIT_SHA" .
+    - docker push "$CI_REGISTRY_IMAGE/api:$CI_COMMIT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE/worker:$CI_COMMIT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE/console:$CI_COMMIT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE/scanner:$CI_COMMIT_SHA"
+    - API_IMAGE_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$CI_REGISTRY_IMAGE/api:$CI_COMMIT_SHA")"
+    - WORKER_IMAGE_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$CI_REGISTRY_IMAGE/worker:$CI_COMMIT_SHA")"
+    - CONSOLE_IMAGE_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$CI_REGISTRY_IMAGE/console:$CI_COMMIT_SHA")"
+    - SCANNER_IMAGE_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$CI_REGISTRY_IMAGE/scanner:$CI_COMMIT_SHA")"
+    - printf 'API_IMAGE_DIGEST=%s\nWORKER_IMAGE_DIGEST=%s\nCONSOLE_IMAGE_DIGEST=%s\nSCANNER_IMAGE_DIGEST=%s\n' "$API_IMAGE_DIGEST" "$WORKER_IMAGE_DIGEST" "$CONSOLE_IMAGE_DIGEST" "$SCANNER_IMAGE_DIGEST" > image-digests.env
+  artifacts:
+    reports:
+      dotenv: image-digests.env
+
+sbom:
+  stage: build
+  image:
+    name: anchore/syft@sha256:c15fa8af4c25edd72c0daf026d095fe51adbcfc7ad5d79a66e93d88f249e5abb
+    entrypoint: [""]
+  needs:
+    - job: build
+      artifacts: true
+  script:
+    - syft "$API_IMAGE_DIGEST" --registry-username "$CI_REGISTRY_USER" --registry-password "$CI_REGISTRY_PASSWORD" -o spdx-json=sbom-api.spdx.json
+    - syft "$WORKER_IMAGE_DIGEST" --registry-username "$CI_REGISTRY_USER" --registry-password "$CI_REGISTRY_PASSWORD" -o spdx-json=sbom-worker.spdx.json
+    - syft "$CONSOLE_IMAGE_DIGEST" --registry-username "$CI_REGISTRY_USER" --registry-password "$CI_REGISTRY_PASSWORD" -o spdx-json=sbom-console.spdx.json
+    - syft "$SCANNER_IMAGE_DIGEST" --registry-username "$CI_REGISTRY_USER" --registry-password "$CI_REGISTRY_PASSWORD" -o spdx-json=sbom-scanner.spdx.json
+  artifacts:
+    paths:
+      - sbom-*.spdx.json
+
+sign:
+  stage: sign
+  image:
+    name: gcr.io/projectsigstore/cosign@sha256:b03690aa52bfe94054187142fba24dc54137650682810633901767d8a3e15b31
+    entrypoint: [""]
+  needs: [build, sbom]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - test -n "$COSIGN_PRIVATE_KEY"
+    - test -n "$COSIGN_PASSWORD"
+    - cosign login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$API_IMAGE_DIGEST"
+    - cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$WORKER_IMAGE_DIGEST"
+    - cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$CONSOLE_IMAGE_DIGEST"
+    - cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$SCANNER_IMAGE_DIGEST"
+    - cosign attest --yes --key env://COSIGN_PRIVATE_KEY --type spdxjson --predicate sbom-api.spdx.json "$API_IMAGE_DIGEST"
+    - cosign attest --yes --key env://COSIGN_PRIVATE_KEY --type spdxjson --predicate sbom-worker.spdx.json "$WORKER_IMAGE_DIGEST"
+    - cosign attest --yes --key env://COSIGN_PRIVATE_KEY --type spdxjson --predicate sbom-console.spdx.json "$CONSOLE_IMAGE_DIGEST"
+    - cosign attest --yes --key env://COSIGN_PRIVATE_KEY --type spdxjson --predicate sbom-scanner.spdx.json "$SCANNER_IMAGE_DIGEST"

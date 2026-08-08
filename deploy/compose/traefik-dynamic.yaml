@@ -1,0 +1,31 @@
+http:
+  middlewares:
+    secure-headers:
+      headers:
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: no-referrer
+  routers:
+    api:
+      entryPoints: [websecure]
+      middlewares: [secure-headers]
+      priority: 100
+      rule: Path(`/health`) || PathPrefix(`/v1`)
+      service: api
+      tls: {}
+    console:
+      entryPoints: [websecure]
+      middlewares: [secure-headers]
+      priority: 1
+      rule: PathPrefix(`/`)
+      service: console
+      tls: {}
+  services:
+    api:
+      loadBalancer:
+        servers:
+          - url: http://api:8000
+    console:
+      loadBalancer:
+        servers:
+          - url: http://console:8080

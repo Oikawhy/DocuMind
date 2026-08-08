@@ -1,0 +1,510 @@
+name: documind
+
+x-service-hardening: &service-hardening
+  security_opt:
+    - no-new-privileges:true
+  deploy:
+    resources:
+      limits:
+        cpus: '1.0'
+        memory: 1G
+
+services:
+  traefik:
+    <<: *service-hardening
+    cap_drop: [ALL]
+    user: "65532:65532"
+    image: ${DOCUMIND_IMAGE_TRAEFIK:?Set DOCUMIND_IMAGE_TRAEFIK to a digest-pinned image reference}
+    command:
+      - --api=false
+      - --providers.docker=false
+      - --providers.file.filename=/etc/traefik/dynamic.yaml
+      - --providers.file.watch=true
+      - --entrypoints.websecure.address=:8443
+      - --entrypoints.websecure.http.tls=true
+      - --log.format=json
+    ports:
+      - 127.0.0.1:8443:8443
+    networks: [edge, app]
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - ./deploy/compose/traefik-dynamic.yaml:/etc/traefik/dynamic.yaml:ro
+
+  console:
+    <<: *service-hardening
+    build:
+      context: .
+      dockerfile: Dockerfile.console
+    networks: [edge]
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
+  postgres:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_POSTGRES:?Set DOCUMIND_IMAGE_POSTGRES to a digest-pinned image reference}
+    environment:
+      POSTGRES_USER_FILE: /run/secrets/postgres_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: documind
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/compose/postgres-init:/docker-entrypoint-initdb.d:ro
+    secrets: [postgres_user, postgres_password]
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$(cat /run/secrets/postgres_user)" -d documind']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_REDIS:?Set DOCUMIND_IMAGE_REDIS to a digest-pinned image reference}
+    command:
+      - /bin/sh
+      - -ec
+      - exec redis-server --appendonly yes --requirepass "$$(cat /run/secrets/redis_password)"
+    volumes:
+      - redis_data:/data
+    secrets: [redis_password]
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, 'redis-cli --no-auth-warning -a "$$(cat /run/secrets/redis_password)" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_MINIO:?Set DOCUMIND_IMAGE_MINIO to a digest-pinned image reference}
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+    volumes:
+      - minio_data:/data
+    secrets: [minio_root_user, minio_root_password]
+    networks: [data]
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:9000/minio/health/live]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  temporal:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_TEMPORAL:?Set DOCUMIND_IMAGE_TEMPORAL to a digest-pinned image reference}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export POSTGRES_USER="$$(cat /run/secrets/postgres_user)"
+        export POSTGRES_PWD="$$(cat /run/secrets/postgres_password)"
+        exec /etc/temporal/entrypoint.sh autosetup
+    environment:
+      DB: postgres12
+      POSTGRES_SEEDS: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: temporal
+      POSTGRES_VISIBILITY_DB: temporal_visibility
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    secrets: [postgres_user, postgres_password]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [data, workflows]
+
+  qdrant:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_QDRANT:?Set DOCUMIND_IMAGE_QDRANT to a digest-pinned image reference}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [data]
+    healthcheck:
+      test: [CMD, /qdrant/qdrant, --version]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  opensearch:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_OPENSEARCH:?Set DOCUMIND_IMAGE_OPENSEARCH to a digest-pinned image reference}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export OPENSEARCH_INITIAL_ADMIN_PASSWORD="$$(cat /run/secrets/opensearch_admin_password)"
+        exec ./opensearch-docker-entrypoint.sh opensearch
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: 'true'
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    secrets: [opensearch_admin_password]
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, 'test "$$(curl --silent --insecure --output /dev/null --write-out "%{http_code}" https://localhost:9200/_cluster/health)" = 401']
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  neo4j:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_NEO4J:?Set DOCUMIND_IMAGE_NEO4J to a digest-pinned image reference}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export NEO4J_AUTH="neo4j/$$(cat /run/secrets/neo4j_password)"
+        export NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
+        exec tini -g -- /startup/docker-entrypoint.sh neo4j
+    environment:
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    secrets: [neo4j_password]
+    networks: [data]
+
+  openbao:
+    <<: *service-hardening
+    build:
+      context: .
+      dockerfile: Dockerfile.openbao
+    entrypoint: [bao]
+    command: [server, -config=/openbao/config/openbao.hcl]
+    cap_add: [IPC_LOCK]
+    volumes:
+      - ./deploy/compose/openbao.hcl:/openbao/config/openbao.hcl:ro
+      - openbao_data:/openbao/data
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, 'BAO_ADDR=http://127.0.0.1:8200 bao status >/dev/null 2>&1']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  openbao-init:
+    <<: *service-hardening
+    build:
+      context: .
+      dockerfile: Dockerfile.openbao
+    entrypoint: [/bin/sh, -ec]
+    environment:
+      BAO_ADDR: http://openbao:8200
+    command:
+      - |
+        while :; do
+          status_output="$$(bao status 2>&1 || true)"
+          if printf '%s' "$$status_output" | grep -q 'Initialized.*false'; then
+            init_output="$$(bao operator init -key-shares=1 -key-threshold=1)"
+            printf '%s\n' "$$init_output" | awk -F ': ' '/Unseal Key 1/ {print $$2}' > /openbao/bootstrap/unseal_key
+            chmod 0400 /openbao/bootstrap/unseal_key
+            status_output="$$(bao status 2>&1 || true)"
+          fi
+          if printf '%s' "$$status_output" | grep -q 'Sealed.*true'; then
+            bao operator unseal "$$(cat /openbao/bootstrap/unseal_key)" >/dev/null
+          fi
+          sleep 5
+        done
+    depends_on:
+      openbao:
+        condition: service_started
+    volumes:
+      - openbao_bootstrap:/openbao/bootstrap
+    networks: [data]
+    read_only: true
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'bao status >/dev/null 2>&1']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  clamav:
+    <<: *service-hardening
+    build:
+      context: .
+      dockerfile: Dockerfile.clamav
+    environment:
+      CLAMAV_NO_FRESHCLAMD: 'true'
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, 'clamdscan --version >/dev/null 2>&1']
+      interval: 30s
+      timeout: 10s
+      retries: 20
+
+  litellm:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_LITELLM:?Set DOCUMIND_IMAGE_LITELLM to a digest-pinned image reference}
+    profiles: [models]
+    user: "10001:10001"
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        export LITELLM_MASTER_KEY="$$(cat /run/secrets/litellm_master_key)"
+        export LITELLM_LOCAL_MODEL_TOKEN="$$(cat /run/secrets/litellm_local_model_token)"
+        exec litellm --config /etc/litellm/config.yaml --host 0.0.0.0 --port 4000
+    volumes:
+      - ./deploy/compose/litellm.yaml:/etc/litellm/config.yaml:ro
+    secrets: [litellm_master_key, litellm_local_model_token]
+    networks: [app, models]
+    read_only: true
+    tmpfs: [/tmp]
+    depends_on:
+      vllm:
+        condition: service_started
+
+  vllm:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_VLLM:?Set DOCUMIND_IMAGE_VLLM to a digest-pinned image reference}
+    profiles: [models]
+    user: "10001:10001"
+    command:
+      - --model
+      - /models/qwen2.5-7b-instruct
+      - --served-model-name
+      - Qwen2.5-7B-Instruct
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8000'
+    volumes:
+      - ${DOCUMIND_MODEL_CACHE_DIR:?Set DOCUMIND_MODEL_CACHE_DIR to a verified local-model cache}:/models:ro
+    networks: [models]
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 32G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  envoy-egress:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_ENVOY:?Set DOCUMIND_IMAGE_ENVOY to a digest-pinned image reference}
+    profiles: [egress]
+    user: "101:101"
+    command: [-c, /etc/envoy/envoy.yaml]
+    volumes:
+      - ./deploy/compose/envoy-egress.yaml:/etc/envoy/envoy.yaml:ro
+    networks: [models, egress]
+    read_only: true
+    tmpfs: [/tmp]
+
+  clickhouse:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_CLICKHOUSE:?Set DOCUMIND_IMAGE_CLICKHOUSE to a digest-pinned image reference}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export CLICKHOUSE_DB=langfuse
+        export CLICKHOUSE_USER=langfuse
+        export CLICKHOUSE_PASSWORD="$$(cat /run/secrets/clickhouse_password)"
+        exec /entrypoint.sh
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    secrets: [clickhouse_password]
+    networks: [data]
+
+  langfuse:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_LANGFUSE:?Set DOCUMIND_IMAGE_LANGFUSE to a digest-pinned image reference}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export DATABASE_URL="postgresql://$$(cat /run/compose-secrets/postgres_user):$$(cat /run/compose-secrets/postgres_password)@postgres:5432/langfuse"
+        export CLICKHOUSE_URL=http://clickhouse:8123
+        export CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+        export CLICKHOUSE_USER=langfuse
+        export CLICKHOUSE_PASSWORD="$$(cat /run/compose-secrets/clickhouse_password)"
+        export NEXTAUTH_SECRET="$$(cat /run/compose-secrets/langfuse_nextauth_secret)"
+        export SALT="$$(cat /run/compose-secrets/langfuse_salt)"
+        export ENCRYPTION_KEY="$$(cat /run/compose-secrets/langfuse_encryption_key)"
+        exec dumb-init -- ./web/entrypoint.sh node ./web/server.js --keepAliveTimeout 110000
+    environment:
+      NEXTAUTH_URL: http://langfuse:3000
+      TELEMETRY_ENABLED: 'false'
+    volumes:
+      - langfuse_runtime_secrets:/run/compose-secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+      compose-secrets-bootstrap:
+        condition: service_completed_successfully
+    networks: [data, observability]
+
+  otel-collector:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_OTEL_COLLECTOR:?Set DOCUMIND_IMAGE_OTEL_COLLECTOR to a digest-pinned image reference}
+    command: [--config=/etc/otelcol/config.yaml]
+    volumes:
+      - ./deploy/compose/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    networks: [observability]
+    read_only: true
+    tmpfs: [/tmp]
+
+  loki:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_LOKI:?Set DOCUMIND_IMAGE_LOKI to a digest-pinned image reference}
+    command: [-config.file=/etc/loki/config.yaml]
+    volumes:
+      - ./deploy/compose/loki.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+    networks: [observability]
+    read_only: true
+    tmpfs: [/tmp]
+
+  tempo:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_TEMPO:?Set DOCUMIND_IMAGE_TEMPO to a digest-pinned image reference}
+    command: [-config.file=/etc/tempo/config.yaml]
+    volumes:
+      - ./deploy/compose/tempo.yaml:/etc/tempo/config.yaml:ro
+      - tempo_data:/var/tempo
+    networks: [observability]
+    read_only: true
+    tmpfs: [/tmp]
+
+  prometheus:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_PROMETHEUS:?Set DOCUMIND_IMAGE_PROMETHEUS to a digest-pinned image reference}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./deploy/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks: [observability]
+
+  compose-secrets-bootstrap:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_BUSYBOX:?Set DOCUMIND_IMAGE_BUSYBOX to a digest-pinned image reference}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /grafana /langfuse
+        cp /run/secrets/grafana_admin_password /grafana/admin_password
+        chown 472:0 /grafana/admin_password
+        chmod 0400 /grafana/admin_password
+        for secret_name in postgres_user postgres_password clickhouse_password langfuse_nextauth_secret langfuse_salt langfuse_encryption_key; do
+          cp "/run/secrets/$${secret_name}" "/langfuse/$${secret_name}"
+          chown 1001:65533 "/langfuse/$${secret_name}"
+          chmod 0400 "/langfuse/$${secret_name}"
+        done
+    secrets:
+      - grafana_admin_password
+      - postgres_user
+      - postgres_password
+      - clickhouse_password
+      - langfuse_nextauth_secret
+      - langfuse_salt
+      - langfuse_encryption_key
+    volumes:
+      - grafana_runtime_secrets:/grafana
+      - langfuse_runtime_secrets:/langfuse
+    network_mode: none
+    restart: 'no'
+
+  grafana:
+    <<: *service-hardening
+    image: ${DOCUMIND_IMAGE_GRAFANA:?Set DOCUMIND_IMAGE_GRAFANA to a digest-pinned image reference}
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/compose-secrets/admin_password
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - grafana_runtime_secrets:/run/compose-secrets:ro
+      - ./deploy/compose/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      compose-secrets-bootstrap:
+        condition: service_completed_successfully
+    networks: [observability]
+
+networks:
+  edge: {}
+  app:
+    internal: true
+  workflows:
+    internal: true
+  data:
+    internal: true
+  observability:
+    internal: true
+  models:
+    internal: true
+  egress: {}
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  qdrant_data:
+  opensearch_data:
+  neo4j_data:
+  neo4j_logs:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:
+  grafana_runtime_secrets:
+  langfuse_runtime_secrets:
+  openbao_data:
+  openbao_bootstrap:
+  loki_data:
+  tempo_data:
+
+secrets:
+  postgres_user:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/postgres_user
+  postgres_password:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/postgres_password
+  redis_password:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/redis_password
+  minio_root_user:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/minio_root_user
+  minio_root_password:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/minio_root_password
+  neo4j_password:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/neo4j_password
+  opensearch_admin_password:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/opensearch_admin_password
+  grafana_admin_password:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/grafana_admin_password
+  clickhouse_password:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/clickhouse_password
+  langfuse_nextauth_secret:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/langfuse_nextauth_secret
+  langfuse_salt:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/langfuse_salt
+  langfuse_encryption_key:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/langfuse_encryption_key
+  litellm_master_key:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/litellm_master_key
+  litellm_local_model_token:
+    file: ${DOCUMIND_COMPOSE_SECRETS_DIR:-.secrets}/litellm_local_model_token

@@ -1,0 +1,16 @@
+.git/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.secrets/
+venv/
+.venv/
+docs/
+tests/
+deploy/
+console/node_modules/
+console/dist/
+contracts/

@@ -1,0 +1,8 @@
+# syntax=docker/dockerfile:1.7
+FROM quay.io/openbao/openbao@sha256:5eedbca9922d85eca5e4bc68c11f968d245b4046641dd4173c1dcff7ae7091aa
+
+USER root
+RUN mkdir -p /openbao/data /openbao/bootstrap \
+    && chown -R 100:1000 /openbao/data /openbao/bootstrap
+
+USER 100:1000

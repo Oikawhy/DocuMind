@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1.7
+# The definition database is baked into a signed evaluation image. Runtime
+# scanner containers have no Internet route and therefore never self-update.
+FROM clamav/clamav@sha256:250249389b7bc9d1f2ba486a663ba8c2fca648e39f02d8fe1fb0f836c055b7f3 AS definitions
+
+USER root
+RUN freshclam --stdout
+
+FROM clamav/clamav@sha256:250249389b7bc9d1f2ba486a663ba8c2fca648e39f02d8fe1fb0f836c055b7f3
+
+COPY --from=definitions --chown=clamav:clamav /var/lib/clamav /var/lib/clamav

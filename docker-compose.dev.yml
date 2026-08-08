@@ -1,0 +1,69 @@
+services:
+  api:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      openbao-init:
+        condition: service_healthy
+    environment:
+      DOCUMIND_DATABASE_URL_REF: openbao://secret/data/documind/database#url
+      DOCUMIND_REDIS_URL_REF: openbao://secret/data/documind/redis#url
+      DOCUMIND_REDIS_STREAMS_URL_REF: openbao://secret/data/documind/redis#streams_url
+      DOCUMIND_MINIO_ENDPOINT: minio:9000
+      DOCUMIND_QDRANT_HOST: qdrant
+      DOCUMIND_OPENSEARCH_HOST: opensearch
+      DOCUMIND_NEO4J_URI: bolt://neo4j:7687
+      DOCUMIND_TEMPORAL_HOST: temporal:7233
+      DOCUMIND_OPENBAO_ADDR: http://openbao:8200
+      DOCUMIND_CLAMAV_HOST: clamav
+      DOCUMIND_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+    networks: [app, workflows, data, models, observability]
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+    healthcheck:
+      test: [CMD, python, -c, "from urllib.request import urlopen; urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    profiles: [worker]
+    depends_on:
+      temporal:
+        condition: service_started
+      openbao-init:
+        condition: service_healthy
+    environment:
+      DOCUMIND_TEMPORAL_HOST: temporal:7233
+      DOCUMIND_OPENBAO_ADDR: http://openbao:8200
+    networks: [workflows, data]
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
