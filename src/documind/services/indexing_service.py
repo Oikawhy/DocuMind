@@ -7,7 +7,6 @@ projections keyed by chunk UUID.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -108,12 +107,19 @@ class QdrantProjectionWriter:
         self._resolver = payload_resolver
 
     async def ensure_collection(self) -> None:
-        """Create collection and payload indexes if absent."""
+        """Create collection and payload indexes if absent.
+
+        Raises ``ProjectionTransientError`` when qdrant-client is not
+        installed or when any payload index creation fails.  Collection
+        setup failures must be visible — silent suppression would let the
+        worker start without the required indexes.
+        """
         try:
             from qdrant_client.models import Distance, VectorParams
-        except ImportError:
-            logger.warning("qdrant_client.models not available; skipping collection setup")
-            return
+        except ImportError as exc:
+            raise ProjectionTransientError(
+                "qdrant_client.models is required for collection setup"
+            ) from exc
 
         exists = await self._client.collection_exists(self._collection)
         if not exists:
@@ -127,11 +133,10 @@ class QdrantProjectionWriter:
             logger.info("Created Qdrant collection %s (%d-dim cosine)", self._collection, self._dimension)
 
         for field_name in _QDRANT_PAYLOAD_INDEXES:
-            with contextlib.suppress(Exception):
-                await self._client.create_payload_index(
-                    self._collection,
-                    field_name=field_name,
-                )
+            await self._client.create_payload_index(
+                self._collection,
+                field_name=field_name,
+            )
 
     async def project(self, snapshot: ProjectionSnapshot) -> ProjectionManifest:
         """Upsert all chunks as Qdrant points with embeddings."""
@@ -204,15 +209,31 @@ _OPENSEARCH_INDEX_SETTINGS: dict[str, Any] = {
         "analysis": {
             "analyzer": {
                 "text_analyzer": {
-                    "type": "standard",
-                    "stopwords": "_none_",
+                    "type": "custom",
+                    "tokenizer": "standard",
+                    "filter": ["lowercase", "asciifolding"],
                 },
+                "english_analyzer": {
+                    "type": "custom",
+                    "tokenizer": "standard",
+                    "filter": ["lowercase", "english_stemmer", "english_stop"],
+                },
+            },
+            "filter": {
+                "english_stemmer": {"type": "stemmer", "language": "english"},
+                "english_stop": {"type": "stop", "stopwords": "_english_"},
             },
         },
     },
     "mappings": {
         "properties": {
-            "content": {"type": "text", "analyzer": "text_analyzer"},
+            "content": {
+                "type": "text",
+                "analyzer": "text_analyzer",
+                "fields": {
+                    "english": {"type": "text", "analyzer": "english_analyzer"},
+                },
+            },
             "document_id": {"type": "keyword"},
             "version_id": {"type": "keyword"},
             "label_ids": {"type": "keyword"},
@@ -249,11 +270,17 @@ class OpenSearchProjectionWriter:
         self._resolver = payload_resolver
 
     async def ensure_index(self) -> None:
-        """Create OpenSearch index with BM25 text + keyword fields if absent."""
+        """Create OpenSearch index with BM25 text + keyword fields if absent.
+
+        Non-absence lookup errors propagate — treating every exception as
+        "index missing" would mask connectivity or permissions failures.
+        """
         try:
             exists = await self._client.indices_exists(self._index)
-        except Exception:
-            exists = False
+        except Exception as exc:
+            raise ProjectionTransientError(
+                f"OpenSearch index existence check failed: {exc}"
+            ) from exc
 
         if not exists:
             await self._client.indices_create(self._index, body=_OPENSEARCH_INDEX_SETTINGS)
