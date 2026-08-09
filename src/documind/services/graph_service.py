@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
 from documind.services.projection_service import (
@@ -166,8 +165,19 @@ class Neo4jProjectionWriter:
         )
 
     @staticmethod
+    def _payload_byte_size(payload: GraphFactPayload) -> int:
+        """Measure the JSON-serializable property data for Neo4j transaction sizing.
+
+        Uses ``dataclasses.asdict`` + ``json.dumps`` to compute the byte
+        length of the serialized payload.  This is the actual data volume
+        that the Neo4j driver will transmit — unlike ``sys.getsizeof``
+        which only measures the shallow Python object header.
+        """
+        return len(json.dumps(asdict(payload), default=str).encode("utf-8"))
+
+    @staticmethod
     def _split_batches(payloads: list[GraphFactPayload]) -> list[list[GraphFactPayload]]:
-        """Split payloads into batches of max 500 facts or 5 MiB."""
+        """Split payloads into batches of max 500 facts or 5 MiB serialized."""
         if not payloads:
             return []
 
@@ -176,7 +186,7 @@ class Neo4jProjectionWriter:
         current_bytes = 0
 
         for payload in payloads:
-            payload_size = sys.getsizeof(payload)
+            payload_size = Neo4jProjectionWriter._payload_byte_size(payload)
             if (
                 len(current_batch) >= _MAX_FACTS_PER_TX or (current_bytes + payload_size) > _MAX_BYTES_PER_TX
             ) and current_batch:
