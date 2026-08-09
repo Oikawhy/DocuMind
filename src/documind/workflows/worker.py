@@ -470,7 +470,13 @@ def _build_projection_coordinator(
 
 
 class _PostgresChunkWriter:
-    """Minimal ChunkWriter that delegates to a session factory."""
+    """Replay-safe ChunkWriter with conflict detection.
+
+    On first write: persists all chunk rows in one transaction.
+    On retry: re-reads existing rows by (version_id, profile_revision_id),
+    verifies they match the candidate chunks, and returns existing metadata.
+    On mismatch: raises ``ChunkWriterConflictError``.
+    """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -485,18 +491,63 @@ class _PostgresChunkWriter:
         import hashlib
         import json
 
-        chunk_count = len(chunks)
-        content_hashes = sorted(getattr(c, "content_sha256", "") for c in chunks)
-        checksum_input = json.dumps(content_hashes, sort_keys=True).encode("utf-8")
-        chunk_checksum = hashlib.sha256(checksum_input).hexdigest()
+        from sqlalchemy import select
+
+        from documind.models.chunk import DocumentChunk
+        from documind.services.chunking_service import ChunkWriterConflictError
 
         async with self._session_factory() as session, session.begin():
+            # Check for existing chunks (replay detection)
+            existing = list(
+                (
+                    await session.execute(
+                        select(DocumentChunk)
+                        .where(
+                            DocumentChunk.version_id == version_id,
+                            DocumentChunk.profile_revision_id == profile_revision_id,
+                        )
+                        .order_by(DocumentChunk.chunk_index)
+                    )
+                ).scalars()
+            )
+
+            if existing:
+                # Verify identical retry vs conflict
+                if len(existing) != len(chunks):
+                    raise ChunkWriterConflictError(
+                        f"Retry chunk count {len(chunks)} differs from persisted {len(existing)}"
+                    )
+                for persisted, candidate in zip(existing, chunks):
+                    if (
+                        persisted.chunk_index != candidate.chunk_index
+                        or persisted.start_offset != candidate.start_offset
+                        or persisted.end_offset != candidate.end_offset
+                        or persisted.content_sha256 != candidate.content_sha256
+                    ):
+                        raise ChunkWriterConflictError(
+                            f"Chunk {candidate.chunk_index} conflicts with persisted chunk"
+                        )
+                # Identical retry — return existing metadata
+                content_hashes = sorted(c.content_sha256 for c in existing)
+                checksum_input = json.dumps(content_hashes, sort_keys=True).encode("utf-8")
+                return {
+                    "chunk_count": len(existing),
+                    "chunk_checksum": hashlib.sha256(checksum_input).hexdigest(),
+                    "version_id": str(version_id),
+                    "profile_revision_id": str(profile_revision_id),
+                    "replay": True,
+                }
+
+            # First write
             for c in chunks:
                 session.add(c)
 
+        chunk_count = len(chunks)
+        content_hashes = sorted(getattr(c, "content_sha256", "") for c in chunks)
+        checksum_input = json.dumps(content_hashes, sort_keys=True).encode("utf-8")
         return {
             "chunk_count": chunk_count,
-            "chunk_checksum": chunk_checksum,
+            "chunk_checksum": hashlib.sha256(checksum_input).hexdigest(),
             "version_id": str(version_id),
             "profile_revision_id": str(profile_revision_id),
         }
