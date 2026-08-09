@@ -163,6 +163,11 @@ class ScannerService:
         if archive_result is not None:
             return archive_result
 
+        # T4-11: Format-specific preflight validation.
+        preflight = _preflight_validate(payload, version_id, detected_mime)
+        if preflight is not None:
+            return preflight
+
         try:
             verdict = await self._clamav_client.scan(payload)
         except ScannerUnavailableError:
@@ -203,7 +208,12 @@ def _mime_is_allowed(detected_mime: str, declared_mime: str) -> bool:
         return True
     if detected_mime == "application/zip" and declared in _ZIP_CONTAINER_MIME_TYPES:
         return True
-    return {detected_mime, declared} <= {"application/xml", "text/xml"}
+    if {detected_mime, declared} <= {"application/xml", "text/xml"}:
+        return True
+    # T4-10: Markdown files are reported as text/plain by libmagic.
+    if detected_mime == "text/plain" and declared == "text/markdown":
+        return True
+    return False
 
 
 def _inspect_zip_archive(
@@ -295,3 +305,179 @@ def _rejected(
         safe_error_code=error_code,
         safe_message=message,
     )
+
+
+# ---------------------------------------------------------------------------
+# T4-11: Format-specific preflight validators
+# ---------------------------------------------------------------------------
+_MAX_PDF_PAGES = 5_000
+_MAX_PDF_OBJECTS = 100_000
+_MAX_IMAGE_PIXELS = 200_000_000
+_MAX_XML_ENTITY_EXPANSIONS = 10_000
+
+
+def _preflight_validate(
+    payload: bytes,
+    version_id: uuid.UUID,
+    detected_mime: str,
+) -> InspectionResult | None:
+    """Dispatch to format-specific preflight checks based on detected MIME."""
+    if detected_mime == "application/pdf":
+        return _preflight_pdf(payload, version_id, detected_mime)
+    if detected_mime in {"image/png", "image/jpeg", "image/tiff"}:
+        return _preflight_image(payload, version_id, detected_mime)
+    if detected_mime in {"application/xml", "text/xml", "text/html"}:
+        return _preflight_xml(payload, version_id, detected_mime)
+    if detected_mime == "application/zip":
+        return _preflight_ooxml(payload, version_id, detected_mime)
+    return None
+
+
+def _preflight_pdf(
+    payload: bytes,
+    version_id: uuid.UUID,
+    detected_mime: str,
+) -> InspectionResult | None:
+    """Reject encrypted PDFs and those exceeding page/object safety limits."""
+    try:
+        # Quick header-level checks without a full parser dependency.
+        header = payload[:1024].decode("latin-1", errors="replace")
+        if "/Encrypt" in header:
+            return _rejected(
+                version_id, detected_mime,
+                error_class="unsafe_content",
+                error_code="PDF_ENCRYPTED",
+                message="Encrypted PDF documents are not supported.",
+            )
+        # Estimate object count from cross-reference markers.
+        obj_count = payload.count(b" obj")
+        if obj_count > _MAX_PDF_OBJECTS:
+            return _rejected(
+                version_id, detected_mime,
+                error_class="unsafe_content",
+                error_code="PDF_OBJECT_LIMIT",
+                message="The PDF exceeds the maximum object count.",
+            )
+        # Estimate page count from /Type /Page markers.
+        page_markers = payload.count(b"/Type /Page") + payload.count(b"/Type/Page")
+        if page_markers > _MAX_PDF_PAGES:
+            return _rejected(
+                version_id, detected_mime,
+                error_class="unsafe_content",
+                error_code="PDF_PAGE_LIMIT",
+                message="The PDF exceeds the maximum page count.",
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _preflight_ooxml(
+    payload: bytes,
+    version_id: uuid.UUID,
+    detected_mime: str,
+) -> InspectionResult | None:
+    """Reject OOXML documents containing macros or external relationships."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            for name in archive.namelist():
+                lower = name.lower()
+                # Reject macro-enabled content.
+                if lower.endswith((".vba", ".bin")) and "vbaproject" in lower:
+                    return _rejected(
+                        version_id, detected_mime,
+                        error_class="unsafe_content",
+                        error_code="OOXML_MACRO_DETECTED",
+                        message="Office documents containing macros are not supported.",
+                    )
+            # Check for external relationships.
+            for name in archive.namelist():
+                if name.endswith(".rels"):
+                    try:
+                        rels_content = archive.read(name).decode("utf-8", errors="replace")
+                        if 'TargetMode="External"' in rels_content:
+                            return _rejected(
+                                version_id, detected_mime,
+                                error_class="unsafe_content",
+                                error_code="OOXML_EXTERNAL_REFERENCE",
+                                message="Office documents with external references are not supported.",
+                            )
+                    except Exception:
+                        pass
+    except (zipfile.BadZipFile, OSError):
+        pass
+    return None
+
+
+def _preflight_xml(
+    payload: bytes,
+    version_id: uuid.UUID,
+    detected_mime: str,
+) -> InspectionResult | None:
+    """Reject XML with entity expansion or remote directives."""
+    try:
+        text = payload[:8192].decode("utf-8", errors="replace")
+        # Check for DOCTYPE declarations with entity definitions.
+        if "<!DOCTYPE" in text.upper() and "<!ENTITY" in text.upper():
+            return _rejected(
+                version_id, detected_mime,
+                error_class="unsafe_content",
+                error_code="XML_ENTITY_EXPANSION",
+                message="XML documents with entity declarations are not supported.",
+            )
+        # Check for external DTD references.
+        if "SYSTEM" in text and "<!DOCTYPE" in text.upper():
+            return _rejected(
+                version_id, detected_mime,
+                error_class="unsafe_content",
+                error_code="XML_EXTERNAL_DTD",
+                message="XML documents with external DTD references are not supported.",
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _preflight_image(
+    payload: bytes,
+    version_id: uuid.UUID,
+    detected_mime: str,
+) -> InspectionResult | None:
+    """Reject images exceeding pixel budget without decoding."""
+    try:
+        import struct as _struct
+
+        if detected_mime == "image/png" and len(payload) > 24:
+            # PNG IHDR chunk: width at offset 16, height at offset 20 (big-endian).
+            width = _struct.unpack(">I", payload[16:20])[0]
+            height = _struct.unpack(">I", payload[20:24])[0]
+            if width * height > _MAX_IMAGE_PIXELS:
+                return _rejected(
+                    version_id, detected_mime,
+                    error_class="unsafe_content",
+                    error_code="IMAGE_PIXEL_LIMIT",
+                    message="The image exceeds the maximum pixel budget.",
+                )
+        elif detected_mime == "image/jpeg":
+            # Scan for SOF markers to find dimensions.
+            offset = 2
+            while offset < len(payload) - 9:
+                if payload[offset] != 0xFF:
+                    break
+                marker = payload[offset + 1]
+                if marker in (0xC0, 0xC1, 0xC2):
+                    height = _struct.unpack(">H", payload[offset + 5 : offset + 7])[0]
+                    width = _struct.unpack(">H", payload[offset + 7 : offset + 9])[0]
+                    if width * height > _MAX_IMAGE_PIXELS:
+                        return _rejected(
+                            version_id, detected_mime,
+                            error_class="unsafe_content",
+                            error_code="IMAGE_PIXEL_LIMIT",
+                            message="The image exceeds the maximum pixel budget.",
+                        )
+                    break
+                seg_len = _struct.unpack(">H", payload[offset + 2 : offset + 4])[0]
+                offset += 2 + seg_len
+    except Exception:
+        pass
+    return None

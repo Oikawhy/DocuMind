@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 from dataclasses import asdict
 from typing import Any, Protocol
 
@@ -43,13 +46,13 @@ async def inspect(stage: StageExecution) -> dict[str, Any]:
     if scanner is None:
         raise RuntimeError("Inspection activity has not been configured.")
     await _assert_active(stage)
-    activity.heartbeat({"stage": stage.name, "version_id": stage.version_id})
 
     async def execute() -> dict[str, Any]:
         result = await scanner.inspect(__import__("uuid").UUID(stage.version_id))
         return asdict(result)
 
-    output = await _run_stage(stage, execute, max_attempts=3)
+    async with _heartbeat_loop(stage):
+        output = await _run_stage(stage, execute, max_attempts=3)
     await _assert_active(stage)
     return _with_stage_checksum(output)
 
@@ -69,3 +72,26 @@ def _with_stage_checksum(output: StageOutput) -> dict[str, Any]:
     payload = dict(output.output)
     payload["stage_output_sha256"] = output.output_sha256
     return payload
+
+
+@asynccontextmanager
+async def _heartbeat_loop(stage: StageExecution, interval: float = 10.0) -> AsyncIterator[None]:
+    """Emit heartbeats every *interval* seconds until the wrapped work completes.
+
+    The 10-second default gives a 3× safety margin on the 30-second
+    heartbeat timeout configured by `StageConfiguration`.
+    """
+    async def _beat() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            activity.heartbeat({"stage": stage.name, "version_id": stage.version_id})
+
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass

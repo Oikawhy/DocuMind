@@ -12,6 +12,7 @@ from documind.services.ocr_service import OCRService
 from documind.workflows.activities.inspect import (
     TombstoneGuard,
     _assert_active,
+    _heartbeat_loop,
     _run_stage,
     _with_stage_checksum,
 )
@@ -43,11 +44,11 @@ async def parse(stage: StageExecution) -> dict[str, Any]:
     if service is None:
         raise RuntimeError("Parse activity has not been configured.")
     await _assert_active(stage)
-    activity.heartbeat({"stage": stage.name, "version_id": stage.version_id})
 
     async def execute() -> dict[str, Any]:
         return asdict(await service.parse(uuid.UUID(stage.version_id)))
 
-    output = await _run_stage(stage, execute, max_attempts=2)
+    async with _heartbeat_loop(stage):
+        output = await _run_stage(stage, execute, max_attempts=2)
     await _assert_active(stage)
     return _with_stage_checksum(output)

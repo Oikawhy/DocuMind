@@ -184,3 +184,31 @@ class StorageService:
     @staticmethod
     def evidence_key(version_id: object, stage: str, attempt: int) -> str:
         return f"evidence/{version_id}/{stage}/{attempt}.json"
+
+    @staticmethod
+    def sealed_key(version_id: object, seal_revision: str) -> str:
+        """Return the deterministic key for a sealed audit anchor."""
+        return f"sealed/{version_id}/{seal_revision}.json"
+
+    async def write_evidence(
+        self,
+        version_id: object,
+        stage: str,
+        attempt: int,
+        payload: dict[str, Any],
+    ) -> str:
+        """Persist evidence for a stage attempt and return its immutable key."""
+        key = self.evidence_key(version_id, stage, attempt)
+        await self.put_json(key, payload)
+        return key
+
+    async def write_sealed(
+        self,
+        version_id: object,
+        seal_revision: str,
+        payload: dict[str, Any],
+    ) -> str:
+        """Persist a sealed audit anchor and return its immutable key."""
+        key = self.sealed_key(version_id, seal_revision)
+        await self.put_json(key, payload)
+        return key

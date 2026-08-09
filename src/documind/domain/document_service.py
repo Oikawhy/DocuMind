@@ -176,7 +176,6 @@ class DocumentService:
         await self._require_authorized(
             principal,
             "upload",
-            resource_labels=[label.id for label in validated_labels],
         )
 
         document_id = uuid.uuid4()
@@ -234,6 +233,20 @@ class DocumentService:
                 )
         except IntegrityError as exc:
             await self._storage_service.remove_object(quarantine_key, ignore_missing=True)
+            # T3-3: Re-read the winning operation for idempotency-key conflicts
+            # before raising a generic conflict error.
+            try:
+                async with self._session_factory() as retry_session:
+                    winner = await self._find_idempotent_operation(
+                        retry_session,
+                        principal.subject,
+                        idempotency_key,
+                        request_hash,
+                    )
+                    if winner is not None:
+                        return self._result_from_operation(winner)
+            except Exception:
+                pass
             raise ResourceConflictError(
                 "A document version with the same content already exists.",
                 code="VERSION_CONFLICT",
@@ -288,8 +301,6 @@ class DocumentService:
             principal,
             "version_create",
             resource_id=document_id,
-            resource_labels=label_ids,
-            resource_lifecycle=latest.lifecycle.value,
         )
 
         version_id = uuid.uuid4()
@@ -379,7 +390,7 @@ class DocumentService:
                 .scalars()
                 .all()
             )
-        await self._require_authorized(principal, "read", resource_id=document_id, resource_labels=labels)
+        await self._require_authorized(principal, "read", resource_id=document_id)
         return document
 
     async def list_documents(
@@ -399,14 +410,18 @@ class DocumentService:
             declared_type = filters.get("type")
             if declared_type:
                 statement = statement.join(DeclaredType).where(DeclaredType.stable_key == declared_type)
+            # T3-2: Apply cursor predicate in SQL before ORDER BY/LIMIT.
+            if cursor_value is not None:
+                cursor_created_at, cursor_id = cursor_value
+                statement = statement.where(
+                    (Document.created_at < cursor_created_at)
+                    | (
+                        (Document.created_at == cursor_created_at)
+                        & (Document.id < uuid.UUID(cursor_id))
+                    )
+                )
             statement = statement.order_by(desc(Document.created_at), desc(Document.id)).limit(limit + 1)
             documents = list((await session.execute(statement)).scalars().all())
-            if cursor_value is not None:
-                documents = [
-                    document
-                    for document in documents
-                    if (document.created_at.isoformat(), str(document.id)) < cursor_value
-                ]
 
             requested_labels = {uuid.UUID(str(label)) for label in filters.get("labels", [])}
             required_state = filters.get("state")
@@ -442,8 +457,6 @@ class DocumentService:
                         principal,
                         "read",
                         resource_id=document.id,
-                        resource_labels=labels,
-                        resource_lifecycle=lifecycle,
                     )
                 except AuthorizationDeniedError:
                     continue
@@ -503,8 +516,6 @@ class DocumentService:
             principal,
             "read_version",
             resource_id=document.id,
-            resource_labels=labels,
-            resource_lifecycle=version.lifecycle.value,
         )
         return version
 
@@ -571,7 +582,7 @@ class DocumentService:
                 .scalars()
                 .all()
             )
-            await self._require_authorized(principal, "delete", resource_id=document_id, resource_labels=labels)
+            await self._require_authorized(principal, "delete", resource_id=document_id)
             request_hash = self._request_hash(
                 target_document_id=document_id,
                 title=locked.title,
@@ -892,16 +903,12 @@ class DocumentService:
         action: str,
         *,
         resource_id: uuid.UUID | None = None,
-        resource_labels: list[uuid.UUID] | None = None,
-        resource_lifecycle: str | None = None,
     ) -> None:
         result = await self._authorization_service.authorize(
             principal=principal,
             action=action,
             resource_type="document",
             resource_id=resource_id,
-            resource_labels=resource_labels,
-            resource_lifecycle=resource_lifecycle,
         )
         decision = getattr(result.decision, "value", result.decision)
         if decision != AuthorizationDecision.ALLOW.value:

@@ -33,3 +33,5 @@ docs/
 .codegraph
 .planning
 docs/superpowers/specs
+gaps/
+test docs/

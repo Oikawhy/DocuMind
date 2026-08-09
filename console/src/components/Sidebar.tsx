@@ -1,8 +1,10 @@
 /**
- * Sidebar navigation component.
+ * Sidebar navigation with health indicator.
  */
 
+import { useEffect, useMemo, useState } from "react";
 import { NavLink } from "react-router-dom";
+import { buildApiClient } from "../api";
 
 interface SidebarProps {
   user: { name?: string; email?: string } | undefined;
@@ -10,12 +12,31 @@ interface SidebarProps {
 }
 
 export function Sidebar({ user, onLogout }: SidebarProps) {
+  const api = useMemo(() => buildApiClient(), []);
+  const [healthy, setHealthy] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    function check() {
+      api
+        .health()
+        .then(() => setHealthy(true))
+        .catch(() => setHealthy(false));
+    }
+    check();
+    const interval = setInterval(check, 30_000);
+    return () => clearInterval(interval);
+  }, [api]);
+
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
         <div className="sidebar-logo">
           <div className="logo-icon">D</div>
           DocuMind
+          <span
+            className={`health-dot ${healthy === true ? "healthy" : healthy === false ? "unhealthy" : ""}`}
+            title={healthy === true ? "Backend connected" : healthy === false ? "Backend unreachable" : "Checking…"}
+          />
         </div>
       </div>
 

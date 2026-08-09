@@ -339,21 +339,88 @@ def _normalize_page(page: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_text(value: str) -> tuple[str, list[dict[str, int]]]:
-    """NFC-normalize while dropping only controls that are not whitespace."""
-    filtered = "".join(
-        character for character in value if not (unicodedata.category(character) == "Cc" and character not in "\t\n\r")
-    )
+    """NFC-normalize while building a source-character-accurate offset map.
+
+    Phase 1 filters control characters (except \\t, \\n, \\r), recording which
+    source positions were removed.  Phase 2 applies NFC and maps filtered
+    positions to their post-composition offsets so downstream chunks can
+    prove exact source character provenance.
+    """
+    # Phase 1: Filter controls, tracking source→filtered position.
+    filtered_chars: list[str] = []
+    source_to_filtered: list[int] = []
+    filtered_pos = 0
+    for character in value:
+        if unicodedata.category(character) == "Cc" and character not in "\t\n\r":
+            source_to_filtered.append(-1)  # removed
+        else:
+            source_to_filtered.append(filtered_pos)
+            filtered_chars.append(character)
+            filtered_pos += 1
+    source_to_filtered.append(filtered_pos)  # sentinel for end-of-string
+
+    filtered = "".join(filtered_chars)
     normalized = unicodedata.normalize("NFC", filtered)
-    # This map intentionally maps source code-point boundaries to the nearest
-    # reproducible normalized boundary; it preserves evidence without claiming
-    # that NFC has a one-to-one character mapping.
-    offsets = [
-        {
-            "source_offset": source_offset,
-            "normalized_offset": min(source_offset, len(normalized)),
-        }
-        for source_offset in range(len(filtered) + 1)
-    ]
+
+    # Phase 2: Map filtered code-point boundaries to NFC boundaries.
+    # Expand both filtered and normalized through NFD to find a common
+    # decomposed representation, then walk forward through both.
+    filtered_nfd = unicodedata.normalize("NFD", filtered)
+    normalized_nfd = unicodedata.normalize("NFD", normalized)
+
+    # Build filtered code-point index → NFD code-point index.
+    filtered_to_nfd: list[int] = []
+    nfd_pos = 0
+    for character in filtered:
+        filtered_to_nfd.append(nfd_pos)
+        nfd_len = len(unicodedata.normalize("NFD", character))
+        nfd_pos += nfd_len
+    filtered_to_nfd.append(nfd_pos)
+
+    # Build NFD code-point index → NFC code-point index.
+    nfc_to_nfd: list[int] = []
+    nfd_pos = 0
+    for character in normalized:
+        nfc_to_nfd.append(nfd_pos)
+        nfd_len = len(unicodedata.normalize("NFD", character))
+        nfd_pos += nfd_len
+    nfc_to_nfd.append(nfd_pos)
+
+    def _nfd_to_nfc(nfd_idx: int) -> int:
+        """Find the NFC position corresponding to an NFD index."""
+        # Binary search for the largest NFC position whose NFD start <= nfd_idx.
+        lo, hi = 0, len(nfc_to_nfd) - 1
+        result = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if nfc_to_nfd[mid] <= nfd_idx:
+                result = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return result
+
+    # Build the full source→normalized offset map.
+    offsets: list[dict[str, int]] = []
+    for source_idx in range(len(value) + 1):
+        filt_idx = source_to_filtered[source_idx]
+        if filt_idx < 0:
+            # Source character was removed; map to the same normalized
+            # position as the next surviving source character.
+            offsets.append({"source_offset": source_idx, "normalized_offset": -1})
+        else:
+            nfd_idx = filtered_to_nfd[min(filt_idx, len(filtered))]
+            nfc_idx = _nfd_to_nfc(nfd_idx)
+            offsets.append({"source_offset": source_idx, "normalized_offset": min(nfc_idx, len(normalized))})
+
+    # Backfill removed positions: point to the next valid normalized offset.
+    last_valid = len(normalized)
+    for i in range(len(offsets) - 1, -1, -1):
+        if offsets[i]["normalized_offset"] < 0:
+            offsets[i]["normalized_offset"] = last_valid
+        else:
+            last_valid = offsets[i]["normalized_offset"]
+
     return normalized, offsets
 
 

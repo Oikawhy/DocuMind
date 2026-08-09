@@ -12,6 +12,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import type { WebStorageStateStore } from "oidc-client-ts";
 
 import { Sidebar } from "./components/Sidebar";
+import { ToastProvider } from "./components/Toast";
 import { Login } from "./pages/Login";
 import { Documents } from "./pages/Documents";
 import { DocumentViewer } from "./pages/DocumentViewer";
@@ -90,30 +91,34 @@ export default function App() {
   // (development mode / placeholder).
   if (!oidcConfig.authority) {
     return (
-      <BrowserRouter>
-        <div className="app-layout">
-          <Sidebar user={undefined} onLogout={() => {}} />
-          <div className="main-content">
-            <Routes>
-              <Route path="/" element={<Navigate to="/documents" replace />} />
-              <Route path="/documents" element={<Documents />} />
-              <Route path="/documents/:id" element={<DocumentViewer />} />
-              <Route path="/chat" element={<Chat />} />
-              <Route path="/operations" element={<Operations />} />
-              <Route path="/admin" element={<Admin />} />
-              <Route path="*" element={<Navigate to="/documents" replace />} />
-            </Routes>
+      <ToastProvider>
+        <BrowserRouter>
+          <div className="app-layout">
+            <Sidebar user={undefined} onLogout={() => {}} />
+            <div className="main-content">
+              <Routes>
+                <Route path="/" element={<Navigate to="/documents" replace />} />
+                <Route path="/documents" element={<Documents />} />
+                <Route path="/documents/:id" element={<DocumentViewer />} />
+                <Route path="/chat" element={<Chat />} />
+                <Route path="/operations" element={<Operations />} />
+                <Route path="/admin" element={<Admin />} />
+                <Route path="*" element={<Navigate to="/documents" replace />} />
+              </Routes>
+            </div>
           </div>
-        </div>
-      </BrowserRouter>
+        </BrowserRouter>
+      </ToastProvider>
     );
   }
 
   return (
-    <AuthProvider {...oidcConfig}>
-      <BrowserRouter>
-        <AuthenticatedShell />
-      </BrowserRouter>
-    </AuthProvider>
+    <ToastProvider>
+      <AuthProvider {...oidcConfig}>
+        <BrowserRouter>
+          <AuthenticatedShell />
+        </BrowserRouter>
+      </AuthProvider>
+    </ToastProvider>
   );
 }

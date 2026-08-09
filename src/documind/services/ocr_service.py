@@ -178,8 +178,13 @@ class OCRService:
         """Parse an inspected version; RapidOCR is never a silent replacement."""
         payload = await self._content_source.read_version_bytes(version_id)
         attempts: list[ParserAttempt] = []
+        docling_unavailable = False
         try:
             docling = await self._docling_parser.parse(payload)
+        except ParserUnavailableError:
+            # T4-7: Operational failure — distinguish from content failure.
+            attempts.append(ParserAttempt(engine="docling", version="unknown", outcome="unavailable"))
+            docling_unavailable = True
         except Exception:
             attempts.append(ParserAttempt(engine="docling", version="unknown", outcome="failed"))
         else:
@@ -190,6 +195,22 @@ class OCRService:
 
         try:
             rapidocr = await self._rapidocr_parser.parse(payload)
+        except ParserUnavailableError:
+            # T4-7: Both parsers are operationally unavailable — let Temporal retry.
+            attempts.append(ParserAttempt(engine="rapidocr", version="unknown", outcome="unavailable"))
+            if docling_unavailable:
+                raise
+            return ParseResult(
+                version_id=str(version_id),
+                success=False,
+                engine=None,
+                text="",
+                pages=[],
+                confidence=0.0,
+                parser_attempts=attempts,
+                safe_error_class="transient_dependency",
+                safe_error_code="PARSER_UNAVAILABLE",
+            )
         except Exception:
             attempts.append(ParserAttempt(engine="rapidocr", version="unknown", outcome="failed"))
             return ParseResult(

@@ -138,11 +138,15 @@ class TemporalWorkflowConsumer:
 
     async def consume(self, cloud_event: dict[str, Any]) -> bool:
         """Start the workflow once; duplicate Redis delivery is a successful no-op."""
+        # T4-4: Validate CloudEvent envelope integrity.
+        if cloud_event.get("specversion") != "1.0":
+            return False
         if cloud_event.get("type") != _DOCUMENT_VERSION_ACCEPTED:
             return False
         event_id = str(cloud_event.get("id", ""))
+        subject = cloud_event.get("subject", "")
         data = cloud_event.get("data")
-        if not event_id or not isinstance(data, dict):
+        if not event_id or not isinstance(data, dict) or not subject:
             return False
         try:
             version_id = uuid.UUID(str(data["version_id"]))
@@ -239,6 +243,8 @@ class RedisStreamWorkflowRunner:
     async def run_once(self, *, count: int = 100) -> int:
         """Process at most one Redis batch and acknowledge completed entries."""
         await self.ensure_group()
+        # T4-5: Reclaim idle pending entries before reading new work.
+        reclaimed = await self._reclaim_pending(count=count)
         response = await self._redis.xreadgroup(
             self._group_name,
             self._consumer_name,
@@ -246,13 +252,41 @@ class RedisStreamWorkflowRunner:
             count=count,
             block=self._block_ms,
         )
-        processed = 0
+        processed = reclaimed
         for _, entries in response or []:
             for entry_id, fields in entries:
                 await self._consumer.consume_stream_fields(_decode_fields(fields))
                 await self._redis.xack(self._stream_name, self._group_name, _as_text(entry_id))
                 processed += 1
         return processed
+
+    async def _reclaim_pending(self, *, count: int = 100, min_idle_ms: int = 60_000) -> int:
+        """Reclaim entries idle longer than min_idle_ms from other consumers."""
+        reclaimed_count = 0
+        try:
+            # XAUTOCLAIM returns [new_start_id, [[id, fields], ...], [deleted_ids]]
+            xautoclaim = getattr(self._redis, "xautoclaim", None)
+            if xautoclaim is None:
+                return 0
+            result = await xautoclaim(
+                self._stream_name,
+                self._group_name,
+                self._consumer_name,
+                min_idle_time=min_idle_ms,
+                start_id="0-0",
+                count=count,
+            )
+            if not result or len(result) < 2:
+                return 0
+            entries = result[1] or []
+            for entry_id, fields in entries:
+                await self._consumer.consume_stream_fields(_decode_fields(fields))
+                await self._redis.xack(self._stream_name, self._group_name, _as_text(entry_id))
+                reclaimed_count += 1
+        except Exception:
+            # Reclamation is best-effort; failures are retried next cycle.
+            pass
+        return reclaimed_count
 
     async def run(self, shutdown: asyncio.Event) -> None:
         """Continuously consume until the worker receives a shutdown signal."""

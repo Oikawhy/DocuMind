@@ -35,6 +35,7 @@ from documind.workflows.activities.project import configure_project_activity, pr
 from documind.workflows.activities.verify import configure_verify_activity, verify
 from documind.workflows.document_version import INGEST_QUEUE, MODEL_QUEUE, DocumentVersionWorkflow
 from documind.workflows.maintenance.outbox_dispatcher import (
+    OutboxDispatcher,
     RedisStreamWorkflowRunner,
     TemporalWorkflowConsumer,
 )
@@ -63,13 +64,36 @@ class IngestionWorkerRuntime:
     ingest_worker: Worker
     model_worker: Worker
     stream_runner: RedisStreamWorkflowRunner
+    dispatcher: OutboxDispatcher
     redis_client: Any
     engine: AsyncEngine
 
     async def run(self, shutdown: asyncio.Event) -> None:
-        """Run both workers and the Redis consumer together until shutdown."""
-        async with self.ingest_worker, self.model_worker:
-            await self.stream_runner.run(shutdown)
+        """Run both workers, the outbox dispatcher, and the Redis consumer together until shutdown."""
+        dispatch_task = asyncio.create_task(
+            self._dispatch_loop(shutdown), name="outbox-dispatcher"
+        )
+        try:
+            async with self.ingest_worker, self.model_worker:
+                await self.stream_runner.run(shutdown)
+        finally:
+            dispatch_task.cancel()
+            try:
+                await dispatch_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _dispatch_loop(self, shutdown: asyncio.Event) -> None:
+        """Periodically publish pending outbox rows to the Redis stream."""
+        while not shutdown.is_set():
+            try:
+                await self.dispatcher.dispatch_once(limit=100)
+            except Exception:
+                logger.exception("outbox_dispatch_error")
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=2.0)
+            except TimeoutError:
+                pass
 
     async def close(self) -> None:
         close = getattr(self.redis_client, "aclose", None)
@@ -229,10 +253,17 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
         activities=[enrich],
     )
 
+    # T4-1: Construct the outbox dispatcher to publish pending rows to Redis.
+    dispatcher = OutboxDispatcher(
+        redis_client=redis_client,
+        session_factory=session_factory,
+    )
+
     return IngestionWorkerRuntime(
         ingest_worker=ingest_worker,
         model_worker=model_worker,
         stream_runner=stream_runner,
+        dispatcher=dispatcher,
         redis_client=redis_client,
         engine=engine,
     )

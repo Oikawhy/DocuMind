@@ -45,16 +45,27 @@ class Principal:
 
 
 class _JWKCache:
-    """In-memory JWK set cache with TTL-based refresh."""
+    """In-memory JWK set cache with TTL-based refresh and hard expiry.
 
-    def __init__(self, ttl_seconds: int) -> None:
+    After ``max_staleness`` seconds without a successful refresh the
+    cache is considered expired and ``is_expired()`` returns ``True``.
+    This enforces fail-closed behaviour: an indefinitely stale cache
+    must not keep accepting tokens.
+    """
+
+    def __init__(self, ttl_seconds: int, *, max_staleness_factor: int = 2) -> None:
         self._ttl = ttl_seconds
+        self._max_staleness = ttl_seconds * max_staleness_factor
         self._jwk_client: jwt.PyJWKClient | None = None
         self._last_refresh: float = 0.0
         self._jwks_uri: str | None = None
 
     def is_stale(self) -> bool:
         return time.monotonic() - self._last_refresh > self._ttl
+
+    def is_expired(self) -> bool:
+        """True when the cache exceeds the hard staleness limit."""
+        return time.monotonic() - self._last_refresh > self._max_staleness
 
     def set_jwks_uri(self, uri: str) -> None:
         if self._jwks_uri != uri:
@@ -113,7 +124,18 @@ class IdentityService:
                         "OIDC discovery is unavailable.",
                         code="TOKEN_INVALID",
                     ) from exc
-                # If stale but we still have a cache, log and continue.
+                # Fail closed: if stale beyond hard limit, reject.
+                if self._jwk_cache.is_expired():
+                    await logger.aerror(
+                        "oidc_jwks_cache_expired",
+                        error=str(exc),
+                        staleness_seconds=time.monotonic() - self._jwk_cache._last_refresh,
+                    )
+                    raise AuthenticationError(
+                        "OIDC key material has expired.",
+                        code="TOKEN_INVALID",
+                    ) from exc
+                # If stale but within max-staleness, log warning and continue.
                 await logger.awarning("oidc_discovery_refresh_failed", error=str(exc))
             else:
                 self._jwk_cache.set_jwks_uri(jwks_uri)
@@ -173,29 +195,37 @@ class IdentityService:
             raise AuthenticationError("Token is invalid.", code="TOKEN_INVALID") from exc
 
         subject = claims["sub"]
-        groups = claims.get("groups", [])
-        if isinstance(groups, str):
-            groups = [groups]
 
-        # Load local identity to check active state.
+        # Load local identity — subject MUST exist in SCIM projection.
         async with self._session_factory() as session:
             identity = await session.get(IdentitySubject, subject)
 
-        if identity is not None and not identity.active:
+        if identity is None:
+            await logger.awarning("oidc_subject_not_provisioned", subject=subject)
+            raise AuthenticationError(
+                "Subject not provisioned.",
+                code="TOKEN_INVALID",
+            )
+
+        if not identity.active:
             raise AuthenticationError(
                 "Identity has been deactivated.",
                 code="TOKEN_INVALID",
             )
 
-        display_name = claims.get("name") or claims.get("preferred_username") or subject
-        email = claims.get("email")
+        # Load authoritative groups from the local SCIM projection,
+        # NOT from token claims.  Token claim groups are untrusted.
+        groups = await self.get_subject_groups(subject)
+
+        display_name = identity.display_name or claims.get("name") or subject
+        email = identity.email or claims.get("email")
 
         principal = Principal(
             subject=subject,
             display_name=display_name,
             email=email,
             groups=groups,
-            active=identity.active if identity is not None else True,
+            active=identity.active,
             issuer=claims["iss"],
             token_claims=claims,
         )

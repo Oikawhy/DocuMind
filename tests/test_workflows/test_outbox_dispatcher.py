@@ -91,6 +91,7 @@ def _cloud_event(version_id: uuid.UUID) -> dict[str, Any]:
         "specversion": "1.0",
         "id": str(uuid.uuid4()),
         "type": "io.documind.document-version.accepted.v1",
+        "subject": f"document-version/{version_id}",
         "data": {
             "version_id": str(version_id),
             "content_sha256": "a" * 64,

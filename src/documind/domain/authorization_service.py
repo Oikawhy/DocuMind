@@ -20,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from documind.domain.errors import PolicyUnavailableError
 from documind.domain.label_service import LabelService
 from documind.domain.policy_service import PolicyService, RoleMapping
-from documind.models.label import DeletionTombstone, LegalHold
+from documind.models.document import Document, DocumentVersion
+from documind.models.label import DeletionTombstone, DocumentLabel, LegalHold
 from documind.services.audit_service import AuditEntry, AuditService
 from documind.services.identity_service import Principal
 
@@ -105,10 +106,12 @@ class AuthorizationService:
         action: str,
         resource_type: str,
         resource_id: uuid.UUID | None = None,
-        resource_labels: list[uuid.UUID] | None = None,
-        resource_lifecycle: str | None = None,
     ) -> AuthorizationResult:
         """Evaluate a deterministic authorization decision.
+
+        When *resource_id* is provided, the canonical resource descriptor
+        (lifecycle and label IDs) is always loaded from the database.
+        Caller-supplied labels or lifecycle are never trusted.
 
         Implements the exact §4.2 pseudocode::
 
@@ -158,7 +161,15 @@ class AuthorizationService:
             await self._emit_audit(principal, action, resource_type, resource_id, result)
             return result
 
-        # 3. Require resource lifecycle compatible with action.
+        # 3. Load the canonical resource descriptor from the database.
+        #    Never trust caller-supplied lifecycle or labels.
+        resource_lifecycle: str | None = None
+        resource_labels: list[uuid.UUID] | None = None
+
+        if resource_id is not None:
+            resource_lifecycle, resource_labels = await self._load_resource_descriptor(resource_id)
+
+        # 4. Require resource lifecycle compatible with action.
         if resource_lifecycle is not None:
             if resource_lifecycle == "erased":
                 result = self._deny(action, "resource_erased", rule_ids)
@@ -175,13 +186,13 @@ class AuthorizationService:
                 await self._emit_audit(principal, action, resource_type, resource_id, result)
                 return result
 
-        # 4. Require resource not tombstoned.
+        # 5. Require resource not tombstoned.
         if resource_id is not None and await self._is_tombstoned(resource_id):
             result = self._deny(action, "resource_tombstoned", rule_ids)
             await self._emit_audit(principal, action, resource_type, resource_id, result)
             return result
 
-        # 5. Require legal hold permits action.
+        # 6. Require legal hold permits action.
         if (
             resource_id is not None
             and action in {"delete", "export", "erase"}
@@ -195,7 +206,7 @@ class AuthorizationService:
             await self._emit_audit(principal, action, resource_type, resource_id, result)
             return result
 
-        # 6–7. Compute effective roles → allowed labels.
+        # 7–8. Compute effective roles → allowed labels.
         allowed_labels = self._union_allowed_labels(role_mappings)
 
         # Check action permission across all roles.
@@ -204,7 +215,7 @@ class AuthorizationService:
             await self._emit_audit(principal, action, resource_type, resource_id, result)
             return result
 
-        # 8. Deny when resource labels not subset of allowed labels.
+        # 9. Deny when resource labels not subset of allowed labels.
         if resource_labels is not None:
             resource_label_set = set(resource_labels)
             if not resource_label_set.issubset(allowed_labels):
@@ -245,6 +256,41 @@ class AuthorizationService:
     def _action_permitted(action: str, mappings: list[RoleMapping]) -> bool:
         """Check if any effective role permits the requested action."""
         return any(action in mapping.permitted_actions for mapping in mappings)
+
+    async def _load_resource_descriptor(
+        self,
+        resource_id: uuid.UUID,
+    ) -> tuple[str | None, list[uuid.UUID] | None]:
+        """Load the canonical lifecycle and label IDs for a document.
+
+        Returns ``(lifecycle_value, label_id_list)``.  If the document
+        is not found (e.g. it doesn't exist), both values are ``None``.
+        """
+        async with self._session_factory() as session:
+            # Load the document to get current_completed_version_id.
+            doc = await session.get(Document, resource_id)
+            if doc is None:
+                return None, None
+
+            # Resolve lifecycle from the current completed version.
+            lifecycle: str | None = None
+            if doc.current_completed_version_id is not None:
+                version = await session.get(DocumentVersion, doc.current_completed_version_id)
+                if version is not None:
+                    lifecycle = version.lifecycle.value if hasattr(version.lifecycle, "value") else str(version.lifecycle)
+
+            # If erased_at is set, treat as erased regardless of version.
+            if doc.erased_at is not None:
+                lifecycle = "erased"
+
+            # Load label IDs from document_label.
+            label_stmt = select(DocumentLabel.label_id).where(
+                DocumentLabel.document_id == resource_id,
+            )
+            label_result = await session.execute(label_stmt)
+            label_ids = list(label_result.scalars().all())
+
+        return lifecycle, label_ids
 
     async def _is_tombstoned(self, resource_id: uuid.UUID) -> bool:
         """Check whether a document has an active deletion tombstone."""
