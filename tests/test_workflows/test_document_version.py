@@ -523,3 +523,85 @@ async def test_full_project_verify_complete_chain_through_replay_store() -> None
 async def _async_return(value: dict[str, object]) -> dict[str, object]:
     """Helper to create an async callable returning a value."""
     return value
+
+
+# ---------------------------------------------------------------------------
+# Runtime path tests (T5-16)
+# ---------------------------------------------------------------------------
+
+
+def test_all_activity_signatures_accept_stage_execution_only() -> None:
+    """Every activity function must accept exactly (stage: StageExecution).
+
+    This catches the T5-01 class of bugs where _execute_stage passes
+    args=[stage] but the activity expects (stage, parsed) or similar.
+    """
+    import inspect
+
+    from documind.workflows.activities.chunk import chunk
+    from documind.workflows.activities.enrich import enrich
+    from documind.workflows.activities.normalize import normalize
+
+    for activity_fn in [normalize, chunk, enrich]:
+        sig = inspect.signature(activity_fn)
+        params = list(sig.parameters.values())
+        # Should have exactly one parameter (stage)
+        assert len(params) == 1, f"{activity_fn.__name__} has {len(params)} params, expected 1"
+        assert params[0].name == "stage", (
+            f"{activity_fn.__name__} first param is '{params[0].name}', expected 'stage'"
+        )
+
+
+def test_normalize_output_excludes_full_content() -> None:
+    """Normalize activity output must not contain text, pages, or blocks.
+
+    This is a regression guard for T5-02 — full document content in
+    Temporal workflow history.
+    """
+    # The normalize activity's execute() returns a dict; verify the keys
+    # it constructs do not include content-bearing fields.
+    # We check the source code to ensure the dict literal doesn't include them.
+    import ast
+    import inspect
+
+    from documind.workflows.activities.normalize import normalize
+
+    source = inspect.getsource(normalize)
+    tree = ast.parse(source)
+
+    # Find all string keys in dict literals within the function
+    dict_keys = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    dict_keys.add(key.value)
+
+    forbidden = {"text", "pages", "blocks"}
+    found_forbidden = dict_keys & forbidden
+    assert not found_forbidden, (
+        f"normalize activity output contains content-bearing keys: {found_forbidden}"
+    )
+
+
+def test_worker_chunking_service_has_tokenizer() -> None:
+    """ChunkingService built by the worker must have a functional _tokenizer.
+
+    Guards against T5-05 regression where __new__() left the object
+    without any attributes.
+    """
+    from unittest.mock import MagicMock
+
+    from documind.workflows.worker import _build_chunking_service
+
+    service = _build_chunking_service(MagicMock())
+    assert hasattr(service, "_tokenizer"), "ChunkingService._tokenizer is not initialized"
+    assert service._tokenizer is not None, "ChunkingService._tokenizer is None"
+    assert hasattr(service._tokenizer, "digest"), "Tokenizer missing 'digest' attribute"
+    assert hasattr(service._tokenizer, "tokenize"), "Tokenizer missing 'tokenize' method"
+
+    # Verify tokenizer actually works
+    tokens = service._tokenizer.tokenize("hello world foo")
+    assert len(tokens) == 3, f"Expected 3 tokens, got {len(tokens)}"
+    assert tokens[0].start_offset == 0
+    assert tokens[0].end_offset == 5
