@@ -62,3 +62,5 @@ class TemplateProposal(Base):
     expires_at: Mapped[datetime] = mapped_column(nullable=False)
     reviewed_by_subject: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=text("now()"))
+
+    __table_args__ = (UniqueConstraint("version_id", name="uq_template_proposal_version"),)

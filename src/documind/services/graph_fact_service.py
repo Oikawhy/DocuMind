@@ -77,9 +77,15 @@ def normalize_entity_key(entity_type: str, display_value: str) -> str:
 
 
 def normalize_literal_key(literal_type: str, unit: str | None, value: str) -> str:
-    """Canonical key for literal-object facts: ``literal:<type>:<unit>:<value>``."""
+    """Canonical key for literal-object facts: ``literal:<type>:<unit>:<value>``.
+
+    Applies NFC normalization, whitespace collapse, and case-folding to the value
+    for consistent deduplication.
+    """
+    nfc_value = unicodedata.normalize("NFC", value)
+    collapsed_value = re.sub(r"\s+", " ", nfc_value).strip()
     unit_part = (unit or "").casefold()
-    return f"literal:{literal_type.casefold()}:{unit_part}:{value}"
+    return f"literal:{literal_type.casefold()}:{unit_part}:{collapsed_value.casefold()}"
 
 
 class GraphFactService:
@@ -191,14 +197,14 @@ class GraphFactService:
                 )
 
                 if existing is not None:
-                    if existing.source_version_id != version_id:
-                        # Different source version — increment corroboration
+                    if existing.source_chunk_id != raw.source_chunk_id:
+                        # Different source chunk — increment corroboration
                         existing.corroboration_count += 1
                         result.facts_corroborated += 1
                     elif existing.conflict_group_key and raw.conflict_group_key:
                         result.facts_conflicted += 1
                     else:
-                        # Same version, same chunk, same route — idempotent retry
+                        # Same chunk, same route — idempotent retry
                         result.facts_skipped += 1
                     continue
 
@@ -244,6 +250,9 @@ class GraphFactService:
         if not (0.0 <= raw.confidence <= 1.0):
             raise GraphFactValidationError(f"Confidence must be between 0 and 1, got {raw.confidence}.")
 
+        if raw.evidence_span is not None and not raw.evidence_span.strip():
+            raise GraphFactValidationError("evidence_span is blank after stripping whitespace.")
+
     async def _upsert_entity(
         self,
         session: AsyncSession,
@@ -283,14 +292,17 @@ class GraphFactService:
         source_chunk_id: uuid.UUID,
         extraction_route_revision_id: uuid.UUID,
     ) -> GraphFact | None:
-        """Find an existing fact by the unique constraint columns."""
+        """Find an existing fact by normalized identity (without source_chunk_id).
+
+        The identity constraint excludes source_chunk_id so that the same
+        normalized fact from a different chunk can increment corroboration.
+        """
         return (
             await session.execute(
                 select(GraphFact).where(
                     GraphFact.subject_entity_id == subject_entity_id,
                     GraphFact.predicate_key == predicate_key,
                     GraphFact.object_normalized_key == object_normalized_key,
-                    GraphFact.source_chunk_id == source_chunk_id,
                     GraphFact.extraction_route_revision_id == extraction_route_revision_id,
                 )
             )

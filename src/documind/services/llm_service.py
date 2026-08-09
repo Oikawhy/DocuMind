@@ -227,18 +227,47 @@ class LLMService:
             json_schema=json_schema,
         )
 
-        # 7. Call the adapter
+        # 7. Call the adapter with retry loop using max_attempts
         start_time = time.monotonic()
         safe_error_class: str | None = None
-        try:
-            response = await self._adapter.invoke(request)
-        except Exception as exc:
-            safe_error_class = type(exc).__name__
-            raise
-        finally:
-            latency_ms = (time.monotonic() - start_time) * 1000
-            # Clear credential from local state
-            credential = None  # noqa: F841
+        response: ProviderResponse | None = None
+        last_exc: Exception | None = None
+
+        for attempt in range(max(1, route.max_attempts)):
+            try:
+                response = await self._adapter.invoke(request)
+                last_exc = None
+                break
+            except Exception as exc:
+                safe_error_class = type(exc).__name__
+                last_exc = exc
+                if attempt >= route.max_attempts - 1:
+                    break
+
+        latency_ms = (time.monotonic() - start_time) * 1000
+
+        # Clear credential from local state immediately
+        credential = None  # noqa: F841
+
+        if last_exc is not None or response is None:
+            # Emit audit on error path before raising
+            if self._audit_sink is not None:
+                error_audit = {
+                    "route_revision_id": str(route.revision_id),
+                    "model_digest": route.model_digest,
+                    "model_alias": route.model_alias,
+                    "consent_id": str(route.external_consent_id) if route.external_consent_id else None,
+                    "input_hash": hashlib.sha256(str(messages).encode("utf-8")).hexdigest(),
+                    "output_hash": None,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "latency_ms": round(latency_ms, 2),
+                    "safe_error_class": safe_error_class,
+                }
+                await self._audit_sink.record(error_audit)
+            if last_exc is not None:
+                raise last_exc
+            raise ModelRouteError(f"Adapter returned no response for role {role.value}.")
 
         # 8. Handle structured output
         structured: StructuredOutputResult | None = None
@@ -248,7 +277,7 @@ class LLMService:
                 json_schema,
             )
             if not structured.valid:
-                # One bounded repair attempt
+                # One bounded repair attempt — include credential
                 repair_messages = messages + [
                     {"role": "assistant", "content": response.content},
                     {
@@ -269,6 +298,7 @@ class LLMService:
                     temperature=limits.temperature,
                     max_output_tokens=limits.max_output_tokens,
                     timeout_seconds=limits.timeout_seconds,
+                    credential=credential,
                     json_schema=json_schema,
                 )
                 try:
