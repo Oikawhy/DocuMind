@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_auth_ref: str = ""
 
+    # Embedding model
+    embedding_model_digest: str = ""
+
     # Temporal
     temporal_host: str = "localhost:7233"
     temporal_namespace: str = "documind"

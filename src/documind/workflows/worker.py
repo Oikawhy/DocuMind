@@ -225,7 +225,7 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
     )
 
     # Configure projection activities: project, verify, complete
-    coordinator = _build_projection_coordinator(session_factory)
+    coordinator = _build_projection_coordinator(session_factory, settings)
     configure_project_activity(
         coordinator,
         tombstone_guard=stage_store,
@@ -394,34 +394,114 @@ def _build_enrichment_service(
 
 def _build_projection_coordinator(
     session_factory: async_sessionmaker[AsyncSession],
+    settings: Any,
 ) -> Any:
-    """Build a ProjectionCoordinator with stub adapters.
+    """Build a ProjectionCoordinator with real PostgreSQL-backed adapters.
 
-    Concrete PostgreSQL adapters for evidence storage, lifecycle completion,
-    and projection writing are wired during full integration.  This provides
-    protocol-compatible stubs for the worker bootstrap.
+    Replaces the former stub implementations with durable evidence,
+    lifecycle completion, generation-aware tombstone checking, and
+    canonical snapshot resolution.  External projection clients (Qdrant,
+    OpenSearch, Neo4j) are not constructed here — they are injected
+    separately during full integration when the respective drivers are
+    available.  This provides protocol-compatible durable adapters for
+    the worker bootstrap.
     """
+    from documind.services.lifecycle_completer import (
+        GenerationAwareTombstoneGuard,
+        PostgresLifecycleCompleter,
+    )
+    from documind.services.projection_evidence_store import PostgresEvidenceStore
     from documind.services.projection_service import (
         ProjectionBackend,
         ProjectionCoordinator,
+    )
+    from documind.services.projection_source import PostgresCanonicalSource
+
+    # Durable PostgreSQL adapters
+    source = PostgresCanonicalSource(session_factory=session_factory)
+    evidence_store = PostgresEvidenceStore(session_factory=session_factory)
+    tombstone_guard = GenerationAwareTombstoneGuard(session_factory=session_factory)
+    lifecycle_completer = PostgresLifecycleCompleter(session_factory=session_factory)
+
+    # Projection writers — use real implementations when external drivers
+    # are available (configured via settings); fall back to pass-through
+    # writers that satisfy the protocol for environments without the
+    # external services running.
+    writers: dict[ProjectionBackend, Any] = {}
+    for backend in ProjectionBackend:
+        writers[backend] = _build_projection_writer(backend, session_factory, settings)
+
+    return ProjectionCoordinator(
+        source=source,
+        writers=writers,
+        evidence_store=evidence_store,
+        tombstone_guard=tombstone_guard,
+        lifecycle_completer=lifecycle_completer,
+        incident_sink=evidence_store,
+    )
+
+
+def _build_projection_writer(
+    backend: Any,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Any,
+) -> Any:
+    """Build a single projection writer for the given backend.
+
+    Attempts to import the real external client driver.  If the driver
+    is not installed (e.g. in minimal test environments), falls back to
+    a lightweight pass-through writer that satisfies the protocol.
+    """
+    from documind.services.projection_service import (
+        ProjectionBackend,
         ProjectionManifest,
         ProjectionSnapshot,
-        WriterOutcome,
         manifest_checksum,
     )
 
-    class _StubSource:
-        async def resolve_snapshot(self, snapshot_id: str) -> ProjectionSnapshot:
-            return ProjectionSnapshot(
-                snapshot_id=snapshot_id,
-                run_id="stub",
-                version_id="stub",
-                generation=1,
-                tombstone_generation=0,
-                records=(),
-            )
+    if backend == ProjectionBackend.QDRANT:
+        try:
+            from qdrant_client import AsyncQdrantClient
 
-    class _StubWriter:
+            from documind.services.indexing_service import QdrantProjectionWriter
+
+            client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+            return QdrantProjectionWriter(
+                client=client,
+                collection=settings.qdrant_collection,
+                dimension=1024,
+            )
+        except ImportError:
+            pass
+
+    elif backend == ProjectionBackend.OPENSEARCH:
+        try:
+            from opensearchpy import AsyncOpenSearch
+
+            from documind.services.indexing_service import OpenSearchProjectionWriter
+
+            client = AsyncOpenSearch(
+                hosts=[{"host": settings.opensearch_host, "port": settings.opensearch_port}],
+            )
+            return OpenSearchProjectionWriter(client=client, index_name=settings.opensearch_index)
+        except ImportError:
+            pass
+
+    elif backend == ProjectionBackend.NEO4J:
+        try:
+            from neo4j import AsyncGraphDatabase
+
+            from documind.services.graph_service import Neo4jProjectionWriter
+
+            neo4j_auth = os.environ.get("DOCUMIND_RESOLVED_NEO4J_AUTH", "")
+            auth_tuple = tuple(neo4j_auth.split(":", 1)) if ":" in neo4j_auth else ("neo4j", "password")
+            driver = AsyncGraphDatabase.driver(settings.neo4j_uri, auth=auth_tuple)
+            return Neo4jProjectionWriter(driver=driver)
+        except ImportError:
+            pass
+
+    # Fallback pass-through writer for environments without external drivers
+    class _PassthroughWriter:
         def __init__(self, backend: ProjectionBackend) -> None:
             self._backend = backend
 
@@ -435,35 +515,7 @@ def _build_projection_coordinator(
                 checksum=manifest_checksum(snapshot.records),
             )
 
-    class _StubEvidence:
-        async def state_for(
-            self,
-            backend: ProjectionBackend,
-            snapshot: ProjectionSnapshot,
-        ) -> WriterOutcome | None:
-            return None
-
-        async def record_outcome(self, outcome: WriterOutcome) -> None:
-            pass
-
-        async def record_manifest(self, manifest: ProjectionManifest) -> None:
-            pass
-
-    class _StubGuard:
-        async def assert_active(self, version_id: str, tombstone_generation: int) -> None:
-            pass
-
-    class _StubCompleter:
-        async def complete_version(self, snapshot: ProjectionSnapshot) -> None:
-            pass
-
-    return ProjectionCoordinator(
-        source=_StubSource(),
-        writers={backend: _StubWriter(backend) for backend in ProjectionBackend},
-        evidence_store=_StubEvidence(),
-        tombstone_guard=_StubGuard(),
-        lifecycle_completer=_StubCompleter(),
-    )
+    return _PassthroughWriter(backend)
 
 
 class _PostgresChunkWriter:
