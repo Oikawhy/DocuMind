@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import asdict
 from typing import Any
 
 from temporalio import activity
@@ -38,14 +37,29 @@ def configure_normalize_activity(
 
 @activity.defn(name="normalize")
 async def normalize(stage: StageExecution) -> dict[str, Any]:
-    """Normalize a successful parse; the parse result is loaded from PostgreSQL."""
+    """Normalize a successful parse; the parse result is loaded from PostgreSQL.
+
+    Returns only checksums and metadata — NEVER full text content.
+    The actual normalized artifact is persisted to MinIO by the service;
+    downstream activities load it from storage, not workflow history.
+    """
     service = _processing_service
     if service is None:
         raise RuntimeError("Normalize activity has not been configured.")
     await _assert_active(stage)
 
     async def execute() -> dict[str, Any]:
-        return asdict(await service.normalize(uuid.UUID(stage.version_id)))
+        result = await service.normalize(uuid.UUID(stage.version_id))
+        # Return only checksums and metadata for compact Temporal history.
+        return {
+            "version_id": result.version_id,
+            "normalization_revision": result.normalization_revision,
+            "content_sha256": result.content_sha256,
+            "normalized_object_key": result.normalized_object_key,
+            "block_count": len(result.blocks),
+            "page_count": len(result.pages),
+            "parser_attempts": result.parser_attempts,
+        }
 
     async with _heartbeat_loop(stage):
         output = await _run_stage(stage, execute, max_attempts=3)

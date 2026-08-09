@@ -158,10 +158,22 @@ class EnrichmentService:
         self,
         *,
         version_id: uuid.UUID,
-        route_revision_id: uuid.UUID,
+        route_revision_id: uuid.UUID | None = None,
     ) -> EnrichmentResult:
         """Run all enrichment sub-tasks for a version."""
         result = EnrichmentResult()
+
+        # Resolve route_revision_id from LLM service if not provided
+        if route_revision_id is None:
+            try:
+                route = await self._llm._route_resolver.newest_active(ModelRole.EXTRACT)
+                if route is None:
+                    result.errors.append("No active EXTRACT route available for enrichment.")
+                    return result
+                route_revision_id = route.revision_id
+            except Exception as exc:
+                result.errors.append(f"Route resolution failed: {type(exc).__name__}")
+                return result
 
         # 1. Load version and chunks
         version = await self._loader.load_version(version_id)
