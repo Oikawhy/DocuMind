@@ -51,25 +51,57 @@ class StubSentenceTransformer:
 
 
 def _make_service(
-    expected_digest: str = "",
-    dimension: int = 1024,
+    expected_digest: str = "test-digest-sha256",
+    allow_unverified: bool = False,
 ) -> EmbeddingService:
     config = EmbeddingModelConfig(
         model_name_or_path="stub-model",
         expected_digest=expected_digest,
-        dimension=dimension,
+        dimension=1024,
+        allow_unverified=allow_unverified,
     )
     service = EmbeddingService(config=config)
     # Bypass actual model loading by injecting stub
-    service._model = StubSentenceTransformer("stub-model", dimension)
+    service._model = StubSentenceTransformer("stub-model", 1024)
     service._encode_fn = service._model.encode  # type: ignore[union-attr]
     service._model_digest = "abc123"
-    service._dimension = dimension
+    service._dimension = 1024
     return service
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Config validation tests (T6-04)
+# ---------------------------------------------------------------------------
+
+
+def test_config_rejects_empty_digest() -> None:
+    """Production config rejects empty expected_digest."""
+    with pytest.raises(ValueError, match="expected_digest"):
+        EmbeddingModelConfig(expected_digest="")
+
+
+def test_config_rejects_non_1024_dimension() -> None:
+    """BGE-M3 contract enforces 1024 dimensions."""
+    with pytest.raises(ValueError, match="1024"):
+        EmbeddingModelConfig(dimension=768, expected_digest="abc123")
+
+
+def test_config_allows_unverified_for_tests() -> None:
+    """Test environments can skip digest enforcement."""
+    config = EmbeddingModelConfig(allow_unverified=True)
+    assert config.expected_digest == ""
+    assert config.dimension == 1024
+
+
+def test_config_accepts_valid_production_config() -> None:
+    """Valid production config passes validation."""
+    config = EmbeddingModelConfig(expected_digest="sha256-digest-here")
+    assert config.dimension == 1024
+    assert config.expected_digest == "sha256-digest-here"
+
+
+# ---------------------------------------------------------------------------
+# Embedding service tests
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +150,7 @@ def test_digest_match_passes() -> None:
 
 def test_no_expected_digest_skips_verification() -> None:
     """Empty expected digest skips verification entirely."""
-    service = _make_service(expected_digest="")
+    service = _make_service(allow_unverified=True, expected_digest="")
     service.verify_digest()  # Should not raise
 
 
@@ -135,7 +167,7 @@ async def test_embed_deterministic() -> None:
 @pytest.mark.asyncio
 async def test_embed_raises_when_not_loaded() -> None:
     """Calling embed before load raises EmbeddingServiceError."""
-    config = EmbeddingModelConfig(model_name_or_path="stub")
+    config = EmbeddingModelConfig(model_name_or_path="stub", allow_unverified=True)
     service = EmbeddingService(config=config)
     with pytest.raises(EmbeddingServiceError, match="not loaded"):
         await service.embed(["test"])
@@ -143,8 +175,8 @@ async def test_embed_raises_when_not_loaded() -> None:
 
 def test_dimension_property() -> None:
     """Dimension property returns configured value."""
-    service = _make_service(dimension=768)
-    assert service.dimension == 768
+    service = _make_service()
+    assert service.dimension == 1024
 
 
 def test_model_digest_property() -> None:
@@ -167,6 +199,7 @@ async def test_embed_batches_large_inputs() -> None:
     config = EmbeddingModelConfig(
         model_name_or_path="stub",
         max_batch_size=2,
+        allow_unverified=True,
     )
     service = EmbeddingService(config=config)
     service._model = StubSentenceTransformer("stub", 1024)

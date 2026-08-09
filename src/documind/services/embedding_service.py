@@ -57,13 +57,32 @@ _MAX_BATCH_SIZE = 32
 
 @dataclass(frozen=True)
 class EmbeddingModelConfig:
-    """Non-secret configuration for the pinned embedding model."""
+    """Non-secret configuration for the pinned embedding model.
+
+    Production deployments must supply a non-empty ``expected_digest``
+    and use the required 1024-dimensional BGE-M3 contract.  Test and
+    development environments may set ``allow_unverified=True`` to bypass
+    the digest requirement while still enforcing the dimension.
+    """
 
     model_name_or_path: str = "BAAI/bge-m3"
     expected_digest: str = ""
     dimension: int = _DEFAULT_DIMENSION
     max_batch_size: int = _MAX_BATCH_SIZE
     normalize: bool = True
+    allow_unverified: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dimension != _DEFAULT_DIMENSION:
+            raise ValueError(
+                f"BGE-M3 contract requires dimension={_DEFAULT_DIMENSION}, got {self.dimension}"
+            )
+        if not self.expected_digest and not self.allow_unverified:
+            raise ValueError(
+                "expected_digest must be a non-empty SHA-256 hex string; "
+                "an unrevisioned model identity is not permitted in production. "
+                "Set allow_unverified=True for test environments."
+            )
 
 
 # ---------------------------------------------------------------------------
