@@ -7,6 +7,7 @@ it must not make its dependencies available to the ingestion queue.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import shlex
@@ -84,10 +85,8 @@ class IngestionWorkerRuntime:
                 await self.stream_runner.run(shutdown)
         finally:
             dispatch_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await dispatch_task
-            except asyncio.CancelledError:
-                pass
 
     async def _dispatch_loop(self, shutdown: asyncio.Event) -> None:
         """Periodically publish pending outbox rows to the Redis stream."""
@@ -96,10 +95,8 @@ class IngestionWorkerRuntime:
                 await self.dispatcher.dispatch_once(limit=100)
             except Exception:
                 logger.exception("outbox_dispatch_error")
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(shutdown.wait(), timeout=2.0)
-            except TimeoutError:
-                pass
 
     async def close(self) -> None:
         close = getattr(self.redis_client, "aclose", None)
@@ -517,7 +514,7 @@ class _PostgresChunkWriter:
                     raise ChunkWriterConflictError(
                         f"Retry chunk count {len(chunks)} differs from persisted {len(existing)}"
                     )
-                for persisted, candidate in zip(existing, chunks):
+                for persisted, candidate in zip(existing, chunks, strict=True):
                     if (
                         persisted.chunk_index != candidate.chunk_index
                         or persisted.start_offset != candidate.start_offset

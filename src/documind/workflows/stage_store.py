@@ -680,8 +680,8 @@ def _exception_error_class(exc: Exception) -> str:
     from documind.services.ocr_service import ParserUnavailableError
     from documind.services.scanner_service import ScannerUnavailableError
 
-    _TRANSIENT = (ConnectionError, OSError, TimeoutError, ScannerUnavailableError, ParserUnavailableError)
-    return "transient_dependency" if isinstance(exc, _TRANSIENT) else "integrity"
+    _transient = (ConnectionError, OSError, TimeoutError, ScannerUnavailableError, ParserUnavailableError)
+    return "transient_dependency" if isinstance(exc, _transient) else "integrity"
 
 
 def _optional_string(value: object) -> str | None:
