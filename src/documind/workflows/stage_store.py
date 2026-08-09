@@ -481,6 +481,111 @@ class PostgresVersionContentSource:
             return version.declared_mime_family
 
 
+class PostgresNormalizedDocumentSource:
+    """Bridge the chunk activity's source protocol to verified normalized content.
+
+    Resolves the version's stored object key and checksums from PostgreSQL,
+    then loads and verifies the normalized artifact from MinIO via the
+    processing service's ``NormalizedDocumentSource``.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        storage: Any,
+    ) -> None:
+        self._session_factory = session_factory
+        self._storage = storage
+
+    async def load(self, version_id: uuid.UUID) -> dict[str, Any]:
+        """Load verified normalized content for the chunk activity."""
+        from dataclasses import asdict
+
+        from documind.services.processing_service import NormalizedDocumentSource as ProcessingSource
+
+        async with self._session_factory() as session:
+            version = await session.get(DocumentVersion, version_id)
+            if version is None:
+                raise StageIntegrityError("Version does not exist.")
+
+            # Read the content_sha256 from the successful normalize stage output
+            run = (
+                await session.execute(
+                    select(ProcessingRun)
+                    .where(ProcessingRun.version_id == version_id)
+                    .order_by(desc(ProcessingRun.started_at), desc(ProcessingRun.id))
+                    .limit(1),
+                )
+            ).scalar_one_or_none()
+            if run is None:
+                raise StageIntegrityError("No processing run exists for normalized content.")
+
+            normalize_stage = (
+                await session.execute(
+                    select(ProcessingStage).where(
+                        ProcessingStage.processing_run_id == run.id,
+                        ProcessingStage.stage_name == "normalize",
+                        ProcessingStage.status == StageStatus.SUCCEEDED,
+                    )
+                )
+            ).scalar_one_or_none()
+            if normalize_stage is None or normalize_stage.output_json is None:
+                raise StageIntegrityError("No successful normalize stage output exists.")
+
+            expected_sha256 = normalize_stage.output_json.get("content_sha256", "")
+            normalized_object_key = version.normalized_object_key
+
+        source = ProcessingSource(storage=self._storage)
+        result = await source.load(
+            normalized_object_key=normalized_object_key,
+            expected_version_id=version_id,
+            expected_content_sha256=expected_sha256,
+        )
+        return asdict(result)
+
+
+class PostgresChunkProfileSource:
+    """Load the pinned chunk profile from the document version's admission selection.
+
+    Reads ``DocumentVersion.selected_chunk_profile_revision_id``, loads the
+    ``ChunkProfileRevision.configuration`` JSONB, and returns it as a dict
+    suitable for ``_build_chunk_profile``.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def load_profile(self, version_id: uuid.UUID) -> dict[str, Any]:
+        """Return the chunk profile data from the version's pinned selection."""
+        from documind.models.policy import ChunkProfileRevision
+
+        async with self._session_factory() as session:
+            version = await session.get(DocumentVersion, version_id)
+            if version is None:
+                raise StageIntegrityError("Version does not exist.")
+            profile_revision_id = version.selected_chunk_profile_revision_id
+            if profile_revision_id is None:
+                raise StageIntegrityError("No chunk profile pinned on version.")
+            profile = await session.get(ChunkProfileRevision, profile_revision_id)
+            if profile is None:
+                raise StageIntegrityError("Pinned chunk profile revision not found.")
+            # ChunkProfileRevision stores config in a JSONB `configuration` column
+            config = profile.configuration or {}
+            return {
+                "revision_id": str(profile.id),
+                "strategy": config.get("strategy", "fixed"),
+                "tokenizer_digest": config.get("tokenizer_digest", ""),
+                "target_tokens": config.get("target_tokens", 512),
+                "overlap_tokens": config.get("overlap_tokens", 0),
+                "embedding_model_digest": config.get("embedding_model_digest", ""),
+                "active": profile.status.value == "active" if hasattr(profile.status, "value") else True,
+                "min_tokens": config.get("min_tokens", 1),
+                "max_tokens": config.get("max_tokens"),
+                "vector_similarity_threshold": config.get("vector_similarity_threshold", 0.45),
+                "recursive_fallback_revision_id": config.get("recursive_fallback_revision_id"),
+            }
+
 def _stage_output(payload: dict[str, Any]) -> StageOutput:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return StageOutput(output=payload, output_sha256=hashlib.sha256(encoded).hexdigest())

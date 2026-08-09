@@ -39,7 +39,13 @@ from documind.workflows.maintenance.outbox_dispatcher import (
     RedisStreamWorkflowRunner,
     TemporalWorkflowConsumer,
 )
-from documind.workflows.stage_store import PostgresParseResultSource, PostgresStageStore, PostgresVersionContentSource
+from documind.workflows.stage_store import (
+    PostgresChunkProfileSource,
+    PostgresNormalizedDocumentSource,
+    PostgresParseResultSource,
+    PostgresStageStore,
+    PostgresVersionContentSource,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,9 +204,18 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
     configure_inspection_activity(scanner, tombstone_guard=stage_store, stage_store=stage_store)
     configure_parse_activity(ocr, tombstone_guard=stage_store, stage_store=stage_store)
     configure_normalize_activity(processing, tombstone_guard=stage_store, stage_store=stage_store)
+
+    normalized_source = PostgresNormalizedDocumentSource(
+        session_factory=session_factory,
+        storage=storage,
+    )
+    chunk_profile_source = PostgresChunkProfileSource(session_factory)
+
     configure_chunk_activity(
         _build_chunking_service(settings),
         _build_chunk_writer(session_factory),
+        normalized_source=normalized_source,
+        chunk_profile_source=chunk_profile_source,
         tombstone_guard=stage_store,
         stage_store=stage_store,
     )
@@ -270,14 +285,38 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
 
 
 def _build_chunking_service(settings: Settings) -> Any:
-    """Build a ChunkingService stub — actual wiring deferred to integration."""
-    # Import here to avoid circular dependency at module level
-    from documind.services.chunking_service import ChunkingService
+    """Build a ChunkingService with a whitespace tokenizer.
 
-    # The actual ChunkingService requires injected tokenizer/segmenter/embedder.
-    # In production, these are resolved from the configuration.  This function
-    # creates a minimal service instance; full wiring is done during integration.
-    return ChunkingService.__new__(ChunkingService)
+    Production deployments should replace the tokenizer adapter with the
+    BGE-M3 tokenizer loaded from ``sentence-transformers``.  This
+    whitespace-based tokenizer provides correct protocol compliance for
+    worker bootstrap and integration testing without model downloads.
+    """
+    from documind.services.chunking_service import ChunkingService, Token
+
+    class _WhitespaceTokenizer:
+        """Protocol-compliant tokenizer that splits on whitespace boundaries.
+
+        Produces non-overlapping tokens with character-accurate offsets
+        matching the Tokenizer protocol.  The digest is deterministic so
+        profiles pinned against this tokenizer are reproducible.
+        """
+
+        digest = "whitespace-tokenizer-v1"
+
+        def tokenize(self, text: str) -> list[Token]:
+            tokens: list[Token] = []
+            offset = 0
+            for i, char in enumerate(text):
+                if char.isspace():
+                    if i > offset:
+                        tokens.append(Token(token_id=len(tokens), start_offset=offset, end_offset=i))
+                    offset = i + 1
+            if offset < len(text):
+                tokens.append(Token(token_id=len(tokens), start_offset=offset, end_offset=len(text)))
+            return tokens
+
+    return ChunkingService(tokenizer=_WhitespaceTokenizer())
 
 
 def _build_chunk_writer(session_factory: async_sessionmaker[AsyncSession]) -> Any:
@@ -291,10 +330,69 @@ def _build_enrichment_service(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> Any:
-    """Build an EnrichmentService stub — actual wiring deferred to integration."""
-    from documind.services.enrichment_service import EnrichmentService
+    """Build an EnrichmentService with stub dependencies.
 
-    return EnrichmentService.__new__(EnrichmentService)
+    Production enrichment requires a real LLMService (with route resolver,
+    credential resolver, and LiteLLM adapter), a GraphFactService, and a
+    VersionLoader.  These stubs fail cleanly with descriptive errors rather
+    than crashing with AttributeError on uninitialized ``__new__`` members.
+    """
+    from documind.services.enrichment_service import EnrichmentService
+    from documind.services.graph_fact_service import FactPersistenceResult
+    from documind.services.llm_service import ModelRouteError
+
+    class _StubRouteResolver:
+        async def newest_active(self, role: Any) -> None:
+            return None
+
+    class _StubLLM:
+        """Stub LLM that reports no active routes."""
+
+        _route_resolver = _StubRouteResolver()
+
+        async def invoke(self, role: Any, messages: Any, *, json_schema: Any = None) -> Any:
+            raise ModelRouteError("LLM service requires production route configuration.")
+
+    class _StubGraphFactService:
+        async def persist_facts(self, **kwargs: Any) -> FactPersistenceResult:
+            return FactPersistenceResult()
+
+    class _StubVersionLoader:
+        def __init__(self, sf: async_sessionmaker[AsyncSession]) -> None:
+            self._session_factory = sf
+
+        async def load_version(self, version_id: Any) -> Any:
+            from documind.models.document import DocumentVersion
+
+            async with self._session_factory() as session:
+                version = await session.get(DocumentVersion, version_id)
+                if version is None:
+                    raise RuntimeError(f"Version {version_id} not found.")
+                return version
+
+        async def load_chunks(self, version_id: Any) -> list[Any]:
+            return []
+
+        async def load_template(self, revision_id: Any) -> None:
+            return None
+
+        async def update_type_suggestion(self, version_id: Any, suggestion: Any) -> None:
+            pass
+
+        async def update_extraction_state(self, version_id: Any, state: Any) -> None:
+            pass
+
+        async def save_extraction(self, extraction: Any) -> None:
+            pass
+
+        async def save_proposal(self, proposal: Any) -> None:
+            pass
+
+    return EnrichmentService(
+        llm_service=_StubLLM(),
+        graph_fact_service=_StubGraphFactService(),
+        version_loader=_StubVersionLoader(session_factory),
+    )
 
 
 def _build_projection_coordinator(

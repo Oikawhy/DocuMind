@@ -43,6 +43,7 @@ class NormalizedDocumentSource:
 _chunking_service: ChunkingService | None = None
 _chunk_writer: ChunkWriter | None = None
 _normalized_source: NormalizedDocumentSource | None = None
+_chunk_profile_source: Any = None
 
 
 def configure_chunk_activity(
@@ -50,14 +51,16 @@ def configure_chunk_activity(
     chunk_writer: ChunkWriter,
     *,
     normalized_source: NormalizedDocumentSource | None = None,
+    chunk_profile_source: Any = None,
     tombstone_guard: TombstoneGuard | None = None,
     stage_store: StageReplayStore,
 ) -> None:
     """Inject worker-owned chunking dependencies."""
-    global _chunking_service, _chunk_writer, _normalized_source
+    global _chunking_service, _chunk_writer, _normalized_source, _chunk_profile_source
     _chunking_service = chunking_service
     _chunk_writer = chunk_writer
     _normalized_source = normalized_source
+    _chunk_profile_source = chunk_profile_source
     from documind.workflows.activities import inspect as inspect_activity
 
     inspect_activity._tombstone_guard = tombstone_guard
@@ -94,7 +97,14 @@ async def chunk(stage: StageExecution) -> dict[str, Any]:
             normalization = {}
 
         normalized = _build_normalized_document(version_id, normalization)
-        profile = _build_chunk_profile(normalization)
+
+        # Resolve chunk profile from the pinned selection (T5-04 fix),
+        # falling back to normalization payload for test compatibility.
+        if _chunk_profile_source is not None:
+            profile_data = await _chunk_profile_source.load_profile(version_id)
+            profile = _build_chunk_profile(profile_data)
+        else:
+            profile = _build_chunk_profile(normalization)
         chunks = service.chunk(normalized, profile)
         result = await writer.write_chunks(version_id, profile.revision_id, chunks)
         # Include profile/effective-profile and chunk count/checksum in output
