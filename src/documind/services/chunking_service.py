@@ -124,7 +124,7 @@ class ChunkingService:
         elif effective_profile.strategy == "vector":
             try:
                 spans = self._vector_spans(normalized.text, tokens, effective_profile)
-            except EmbeddingDependencyError:
+            except (EmbeddingDependencyError, RuntimeError, ConnectionError, OSError):
                 effective_profile = self._resolve_vector_fallback(effective_profile)
                 spans = self._recursive_spans(normalized.text, tokens, effective_profile)
         else:
@@ -254,6 +254,29 @@ class ChunkingService:
             flush_buffer()
             buffered_start, buffered_end = block.start_offset, block.end_offset
         flush_buffer()
+
+        # Enforce min_tokens by merging short spans into the previous one
+        min_tok = getattr(profile, "min_tokens", 0) or 0
+        if min_tok > 0 and len(spans) > 1:
+            merged: list[tuple[int, int, int]] = [spans[0]]
+            for span in spans[1:]:
+                start, end, count = span
+                if count < min_tok:
+                    # Attach to previous span
+                    prev_start, _, _ = merged[-1]
+                    merged[-1] = (prev_start, end, self._span_token_count(tokens, prev_start, end))
+                else:
+                    merged.append(span)
+            # Also check if the last span is too short
+            if len(merged) > 1:
+                _, _, last_count = merged[-1]
+                if last_count < min_tok:
+                    prev_start, _, _ = merged[-2]
+                    last_end = merged[-1][1]
+                    merged[-2] = (prev_start, last_end, self._span_token_count(tokens, prev_start, last_end))
+                    merged.pop()
+            return merged
+
         return spans
 
     def _vector_spans(
@@ -341,6 +364,7 @@ class ChunkingService:
 
     @staticmethod
     def _split_on_separator(text: str, start_offset: int, end_offset: int, separator: str) -> list[tuple[int, int]]:
+        """Split text on separator boundaries, keeping separator in the preceding piece."""
         pieces: list[tuple[int, int]] = []
         cursor = start_offset
         while cursor < end_offset:
@@ -349,9 +373,11 @@ class ChunkingService:
                 if cursor < end_offset:
                     pieces.append((cursor, end_offset))
                 break
-            if cursor < boundary:
-                pieces.append((cursor, boundary))
-            cursor = boundary + len(separator)
+            # Include the separator in the preceding piece
+            piece_end = boundary + len(separator)
+            if cursor < piece_end:
+                pieces.append((cursor, piece_end))
+            cursor = piece_end
         return pieces
 
     def _pack_units(
