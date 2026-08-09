@@ -146,27 +146,30 @@ def test_checksum_chain_is_deterministic_across_stages() -> None:
     enrich_stage = _stage_execution(version_id, "enrich", enrich_input)
     assert enrich_stage.input_sha256 == enrich_input
 
-    # project receives SHA-256 of enrich output
+    # project, verify, and complete all use the same snapshot identity:
+    # the enriched-output checksum.  This ensures the projection
+    # coordinator can match outcomes across all three stages.
     enrich_output = {
         "type_suggestion": {"value": "invoice"},
         "extraction_status": "validated",
         "fact_result": {"entities_created": 3, "facts_created": 5},
     }
-    project_input = _payload_sha256(enrich_output)
-    project_stage = _stage_execution(version_id, "project", project_input)
-    assert project_stage.input_sha256 == project_input
+    snapshot_checksum = _payload_sha256(enrich_output)
 
-    # verify receives SHA-256 of project output
-    project_output = {"snapshot_id": "snap-1", "status": "projected"}
-    verify_input = _payload_sha256(project_output)
-    verify_stage = _stage_execution(version_id, "verify", verify_input)
-    assert verify_stage.input_sha256 == verify_input
+    project_stage = _stage_execution(version_id, "project", snapshot_checksum)
+    assert project_stage.input_sha256 == snapshot_checksum
 
-    # complete receives SHA-256 of verify output
-    verify_output = {"status": "verified", "manifest_count": 3}
-    complete_input = _payload_sha256(verify_output)
-    complete_stage = _stage_execution(version_id, "complete", complete_input)
-    assert complete_stage.input_sha256 == complete_input
+    verify_stage = _stage_execution(version_id, "verify", snapshot_checksum)
+    assert verify_stage.input_sha256 == snapshot_checksum
+
+    complete_stage = _stage_execution(version_id, "complete", snapshot_checksum)
+    assert complete_stage.input_sha256 == snapshot_checksum
+
+    # All three stages share the same snapshot identity but have
+    # distinct idempotency keys because the stage name differs.
+    assert project_stage.idempotency_key != verify_stage.idempotency_key
+    assert verify_stage.idempotency_key != complete_stage.idempotency_key
+    assert project_stage.idempotency_key != complete_stage.idempotency_key
 
 
 def test_stage_idempotency_key_includes_version_stage_and_checksum() -> None:
@@ -480,13 +483,15 @@ async def test_complete_stage_replay_is_idempotent() -> None:
 
 
 async def test_full_project_verify_complete_chain_through_replay_store() -> None:
-    """All three projection stages chain correctly through InMemoryStageReplayStore."""
+    """All three projection stages share one snapshot identity through InMemoryStageReplayStore."""
     version_id = str(uuid.uuid4())
     store = InMemoryStageReplayStore()
 
-    # Stage 1: project
-    project_input = hashlib.sha256(b"enrichment done").hexdigest()
-    project_stage = _stage_execution(version_id, "project", project_input)
+    # The snapshot identity is established once from the enriched output.
+    snapshot_checksum = hashlib.sha256(b"enrichment done").hexdigest()
+
+    # Stage 1: project — uses snapshot_checksum
+    project_stage = _stage_execution(version_id, "project", snapshot_checksum)
 
     project_output = await store.run(
         project_stage,
@@ -494,9 +499,8 @@ async def test_full_project_verify_complete_chain_through_replay_store() -> None
     )
     assert project_output.output["status"] == "projected"
 
-    # Stage 2: verify (takes checksum of project output)
-    verify_input = _payload_sha256(project_output.output)
-    verify_stage = _stage_execution(version_id, "verify", verify_input)
+    # Stage 2: verify — same snapshot_checksum
+    verify_stage = _stage_execution(version_id, "verify", snapshot_checksum)
 
     verify_output = await store.run(
         verify_stage,
@@ -505,9 +509,8 @@ async def test_full_project_verify_complete_chain_through_replay_store() -> None
     assert verify_output.output["status"] == "verified"
     assert verify_output.output["manifest_count"] == 3
 
-    # Stage 3: complete (takes checksum of verify output)
-    complete_input = _payload_sha256(verify_output.output)
-    complete_stage = _stage_execution(version_id, "complete", complete_input)
+    # Stage 3: complete — same snapshot_checksum
+    complete_stage = _stage_execution(version_id, "complete", snapshot_checksum)
 
     complete_output = await store.run(
         complete_stage,
@@ -515,7 +518,9 @@ async def test_full_project_verify_complete_chain_through_replay_store() -> None
     )
     assert complete_output.output["status"] == "completed"
 
-    # Verify all three have distinct idempotency keys
+    # All three stages share the same snapshot identity but have distinct
+    # idempotency keys because stage_name differs in the key derivation.
+    assert project_stage.input_sha256 == verify_stage.input_sha256 == complete_stage.input_sha256
     assert project_stage.idempotency_key != verify_stage.idempotency_key
     assert verify_stage.idempotency_key != complete_stage.idempotency_key
 

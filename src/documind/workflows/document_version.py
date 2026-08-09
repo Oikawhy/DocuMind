@@ -215,21 +215,21 @@ class DocumentVersionWorkflow:
         enriched = await self._execute_stage("enrich", enrich_stage)
 
         # --- Stage 6: project ---
-        # Project fans out embeddings + Qdrant/OpenSearch/Neo4j writes.
-        current_checksum = _payload_sha256(enriched)
-        project_stage = _stage_execution(workflow_input.version_id, "project", current_checksum)
+        # The snapshot identity is the enriched-output checksum.  Project,
+        # verify, and complete all reference the same frozen snapshot so
+        # the coordinator can match outcomes across all three stages.
+        snapshot_checksum = _payload_sha256(enriched)
+        project_stage = _stage_execution(workflow_input.version_id, "project", snapshot_checksum)
         projected = await self._execute_stage("project", project_stage)
 
         # --- Stage 7: verify ---
-        # Verify count/checksum comparison across all 3 backends.
-        current_checksum = _payload_sha256(projected)
-        verify_stage = _stage_execution(workflow_input.version_id, "verify", current_checksum)
-        verified = await self._execute_stage("verify", verify_stage)
+        # Same snapshot identity — verify looks up outcomes recorded by project.
+        verify_stage = _stage_execution(workflow_input.version_id, "verify", snapshot_checksum)
+        verified = await self._execute_stage("verify", verify_stage)  # noqa: F841
 
         # --- Stage 8: complete ---
-        # Tombstone guard + lifecycle → completed + event emission.
-        current_checksum = _payload_sha256(verified)
-        complete_stage = _stage_execution(workflow_input.version_id, "complete", current_checksum)
+        # Same snapshot identity — complete checks verified set from verify.
+        complete_stage = _stage_execution(workflow_input.version_id, "complete", snapshot_checksum)
         completed = await self._execute_stage("complete", complete_stage)
 
         return DocumentVersionWorkflowResult(
