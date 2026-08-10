@@ -1,11 +1,12 @@
-"""Embedding service unit tests using stubs (no real BGE-M3 weights required)."""
+"""Embedding service tests using local artifacts and injected model loaders."""
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
 
 import pytest
 
+from documind.services import embedding_service
 from documind.services.embedding_service import (
     EmbeddingIntegrityError,
     EmbeddingModelConfig,
@@ -13,16 +14,14 @@ from documind.services.embedding_service import (
     EmbeddingServiceError,
 )
 
-# ---------------------------------------------------------------------------
-# Stub model for tests
-# ---------------------------------------------------------------------------
+_VALID_DIGEST = "sha256:" + "0" * 64
 
 
 class StubEncoder:
-    """Mimics SentenceTransformer.encode output."""
+    """Mimics ``SentenceTransformer.encode`` output."""
 
     def __init__(self, dimension: int = 1024) -> None:
-        self._dim = dimension
+        self._dimension = dimension
 
     def __call__(
         self,
@@ -30,182 +29,317 @@ class StubEncoder:
         normalize_embeddings: bool = True,
         show_progress_bar: bool = False,
     ) -> list[list[float]]:
-        return [[float(i + j) / max(1, len(t)) for j in range(self._dim)] for i, t in enumerate(texts)]
+        return [
+            [float(index + component) / max(1, len(text)) for component in range(self._dimension)]
+            for index, text in enumerate(texts)
+        ]
 
 
 class StubSentenceTransformer:
-    """Minimal stub replacing sentence_transformers.SentenceTransformer."""
+    """Minimal local model double with a native dimension declaration."""
 
-    def __init__(self, model_name: str, truncate_dim: int | None = None) -> None:
-        self._name = model_name
-        self._dim = truncate_dim or 1024
-        self.encode = StubEncoder(self._dim)
+    def __init__(self, dimension: int | None = 1024) -> None:
+        self._dimension = dimension
+        self.encode = StubEncoder(dimension or 1024)
 
-    def state_dict(self) -> dict[str, Any]:
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+    def get_sentence_embedding_dimension(self) -> int | None:
+        return self._dimension
 
 
-def _make_service(
-    expected_digest: str = "test-digest-sha256",
-    allow_unverified: bool = False,
-) -> EmbeddingService:
-    config = EmbeddingModelConfig(
-        model_name_or_path="stub-model",
-        expected_digest=expected_digest,
-        dimension=1024,
-        allow_unverified=allow_unverified,
+def _write_artifact(root: Path) -> Path:
+    root.mkdir()
+    (root / "config.json").write_text('{"model_type":"bge-m3"}', encoding="utf-8")
+    (root / "weights.bin").write_bytes(b"deterministic test weights")
+    return root
+
+
+def _artifact_digest(root: Path) -> str:
+    """Call the public artifact digest boundary once it has been implemented."""
+    return embedding_service.compute_artifact_digest(root)  # type: ignore[attr-defined]
+
+
+def _config(
+    artifact: Path,
+    *,
+    expected_digest: str | None = None,
+    max_batch_size: int = 32,
+) -> EmbeddingModelConfig:
+    return EmbeddingModelConfig(
+        model_path=artifact,
+        expected_digest=expected_digest or _artifact_digest(artifact),
+        max_batch_size=max_batch_size,
     )
-    service = EmbeddingService(config=config)
-    # Bypass actual model loading by injecting stub
-    service._model = StubSentenceTransformer("stub-model", 1024)
-    service._encode_fn = service._model.encode  # type: ignore[union-attr]
-    service._model_digest = "abc123"
-    service._dimension = 1024
-    return service
+
+
+def _make_loaded_service(
+    artifact: Path,
+    *,
+    dimension: int = 1024,
+    max_batch_size: int = 32,
+) -> tuple[EmbeddingService, list[Path]]:
+    calls: list[Path] = []
+    model = StubSentenceTransformer(dimension)
+
+    def loader(model_path: Path) -> StubSentenceTransformer:
+        calls.append(model_path)
+        return model
+
+    service = EmbeddingService(
+        config=_config(artifact, max_batch_size=max_batch_size),
+        model_loader=loader,
+    )
+    service.load()
+    return service, calls
 
 
 # ---------------------------------------------------------------------------
-# Config validation tests (T6-04)
+# Config and artifact identity
 # ---------------------------------------------------------------------------
 
 
-def test_config_rejects_empty_digest() -> None:
-    """Production config rejects empty expected_digest."""
+def test_config_rejects_relative_model_path(tmp_path: Path) -> None:
+    """A symbolic or relative model reference cannot identify a local artifact."""
+    with pytest.raises(ValueError, match="absolute"):
+        EmbeddingModelConfig(model_path=Path("models/bge-m3"), expected_digest=_VALID_DIGEST)
+
+
+def test_config_rejects_missing_model_directory(tmp_path: Path) -> None:
+    """The pinned local artifact must exist when configuration is created."""
+    with pytest.raises(ValueError, match="existing directory"):
+        EmbeddingModelConfig(model_path=tmp_path / "missing", expected_digest=_VALID_DIGEST)
+
+
+def test_config_rejects_root_symlink(tmp_path: Path) -> None:
+    """A deployment artifact root must be a real directory, never a link."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    symlink = tmp_path / "artifact-link"
+    symlink.symlink_to(artifact, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        EmbeddingModelConfig(model_path=symlink, expected_digest=_artifact_digest(artifact))
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "",
+        "0" * 64,
+        "sha256:" + "A" * 64,
+        "sha256:" + "0" * 63,
+    ],
+)
+def test_config_rejects_malformed_digest(tmp_path: Path, digest: str) -> None:
+    """Artifact pinning only accepts a complete lowercase SHA-256 identity."""
+    artifact = _write_artifact(tmp_path / "artifact")
     with pytest.raises(ValueError, match="expected_digest"):
-        EmbeddingModelConfig(expected_digest="")
+        EmbeddingModelConfig(model_path=artifact, expected_digest=digest)
 
 
-def test_config_rejects_non_1024_dimension() -> None:
-    """BGE-M3 contract enforces 1024 dimensions."""
+def test_config_rejects_non_contract_dimension(tmp_path: Path) -> None:
+    """BGE-M3 contract is fixed at 1024 dimensions."""
+    artifact = _write_artifact(tmp_path / "artifact")
     with pytest.raises(ValueError, match="1024"):
-        EmbeddingModelConfig(dimension=768, expected_digest="abc123")
+        EmbeddingModelConfig(
+            model_path=artifact,
+            expected_digest=_VALID_DIGEST,
+            dimension=768,
+        )
 
 
-def test_config_allows_unverified_for_tests() -> None:
-    """Test environments can skip digest enforcement."""
-    config = EmbeddingModelConfig(allow_unverified=True)
-    assert config.expected_digest == ""
-    assert config.dimension == 1024
+def test_config_rejects_non_positive_batch_size(tmp_path: Path) -> None:
+    """Batching cannot make forward progress with zero items per batch."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    with pytest.raises(ValueError, match="max_batch_size"):
+        EmbeddingModelConfig(
+            model_path=artifact,
+            expected_digest=_VALID_DIGEST,
+            max_batch_size=0,
+        )
 
 
-def test_config_accepts_valid_production_config() -> None:
-    """Valid production config passes validation."""
-    config = EmbeddingModelConfig(expected_digest="sha256-digest-here")
-    assert config.dimension == 1024
-    assert config.expected_digest == "sha256-digest-here"
+def test_artifact_digest_changes_for_paths_and_contents(tmp_path: Path) -> None:
+    """The digest commits to every artifact-relative filename and byte."""
+    first = _write_artifact(tmp_path / "first")
+    second = _write_artifact(tmp_path / "second")
+    (second / "weights.bin").rename(second / "renamed-weights.bin")
+
+    first_digest = _artifact_digest(first)
+    assert _artifact_digest(second) != first_digest
+
+    (first / "weights.bin").write_bytes(b"changed deterministic test weights")
+    assert _artifact_digest(first) != first_digest
+
+
+def test_artifact_digest_rejects_symlinked_files(tmp_path: Path) -> None:
+    """Artifact pinning refuses links that could change identity after validation."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"outside artifact")
+    (artifact / "linked.bin").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _artifact_digest(artifact)
+
+
+def test_artifact_digest_rejects_root_symlink(tmp_path: Path) -> None:
+    """The direct digest boundary rejects a symlinked artifact root too."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    symlink = tmp_path / "artifact-link"
+    symlink.symlink_to(artifact, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _artifact_digest(symlink)
+
+
+def test_artifact_digest_rejects_empty_tree(tmp_path: Path) -> None:
+    """A model identity cannot be derived from an empty artifact directory."""
+    artifact = tmp_path / "empty-artifact"
+    artifact.mkdir()
+
+    with pytest.raises(ValueError, match="no regular files"):
+        _artifact_digest(artifact)
+
+
+def test_artifact_digest_rejects_file_path(tmp_path: Path) -> None:
+    """A local model artifact boundary accepts directories only."""
+    artifact_file = tmp_path / "artifact.bin"
+    artifact_file.write_bytes(b"not a directory")
+
+    with pytest.raises(ValueError, match="existing directory"):
+        _artifact_digest(artifact_file)
 
 
 # ---------------------------------------------------------------------------
-# Embedding service tests
+# Loading and inference
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_embed_returns_correct_dimension() -> None:
-    """Verify 1024-dim output for a single text."""
-    service = _make_service()
-    result = await service.embed(["hello world"])
-    assert len(result) == 1
-    assert len(result[0]) == 1024
+def test_load_rejects_digest_mismatch_before_invoking_loader(tmp_path: Path) -> None:
+    """No unverified artifact may be handed to a model loader."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    calls: list[Path] = []
+
+    def loader(model_path: Path) -> StubSentenceTransformer:
+        calls.append(model_path)
+        return StubSentenceTransformer()
+
+    service = EmbeddingService(
+        config=_config(artifact, expected_digest=_VALID_DIGEST),
+        model_loader=loader,
+    )
+
+    with pytest.raises(EmbeddingIntegrityError, match="mismatch"):
+        service.load()
+    assert calls == []
+
+
+def test_load_accepts_matching_local_artifact(tmp_path: Path) -> None:
+    """A digest-matched 1024-dimensional local model becomes usable."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service, calls = _make_loaded_service(artifact)
+
+    assert calls == [artifact]
+    assert service.dimension == 1024
+    assert service.model_digest == _artifact_digest(artifact)
+
+
+@pytest.mark.parametrize("dimension", [None, 768])
+def test_load_rejects_model_with_non_contract_native_dimension(
+    tmp_path: Path,
+    dimension: int | None,
+) -> None:
+    """A loader cannot alter BGE-M3 output dimensionality."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    calls: list[Path] = []
+
+    def loader(model_path: Path) -> StubSentenceTransformer:
+        calls.append(model_path)
+        return StubSentenceTransformer(dimension)
+
+    service = EmbeddingService(config=_config(artifact), model_loader=loader)
+    with pytest.raises(EmbeddingIntegrityError, match="1024"):
+        service.load()
+
+    assert calls == [artifact]
+    with pytest.raises(EmbeddingServiceError, match="not loaded"):
+        service.embed_sync(["cannot use invalid model"])
 
 
 @pytest.mark.asyncio
-async def test_embed_batch_preserves_order() -> None:
-    """N inputs produce N outputs in the same order."""
-    service = _make_service()
+async def test_embed_returns_correct_dimension_and_preserves_order(tmp_path: Path) -> None:
+    """The loaded service returns one 1024-dimensional vector per input."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service, _ = _make_loaded_service(artifact)
+
     texts = ["alpha", "beta", "gamma"]
     result = await service.embed(texts)
+
     assert len(result) == len(texts)
-    # Different texts should produce different vectors
+    assert all(len(vector) == 1024 for vector in result)
     assert result[0] != result[1]
     assert result[1] != result[2]
 
 
 @pytest.mark.asyncio
-async def test_embed_empty_input() -> None:
-    """Empty list returns empty list."""
-    service = _make_service()
-    result = await service.embed([])
-    assert result == []
+async def test_embed_does_not_use_the_event_loop_default_executor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inference is isolated from the loop-owned default executor lifecycle."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service, _ = _make_loaded_service(artifact)
 
+    def fail_if_called(*args: object, **kwargs: object) -> object:
+        raise AssertionError("embed must not dispatch through asyncio.to_thread")
 
-def test_digest_mismatch_raises() -> None:
-    """Wrong digest raises EmbeddingIntegrityError."""
-    service = _make_service(expected_digest="expected_abc123")
-    # model_digest is "abc123", expected is "expected_abc123"
-    with pytest.raises(EmbeddingIntegrityError, match="mismatch"):
-        service.verify_digest()
+    monkeypatch.setattr(embedding_service.asyncio, "to_thread", fail_if_called)
+    try:
+        result = await service.embed(["alpha"])
+    finally:
+        service.close()
 
-
-def test_digest_match_passes() -> None:
-    """Correct digest does not raise."""
-    service = _make_service(expected_digest="abc123")
-    service.verify_digest()  # Should not raise
-
-
-def test_no_expected_digest_skips_verification() -> None:
-    """Empty expected digest skips verification entirely."""
-    service = _make_service(allow_unverified=True, expected_digest="")
-    service.verify_digest()  # Should not raise
+    assert len(result) == 1
+    assert len(result[0]) == 1024
 
 
 @pytest.mark.asyncio
-async def test_embed_deterministic() -> None:
-    """Same text produces the same vector."""
-    service = _make_service()
-    text = "deterministic check"
-    result1 = await service.embed([text])
-    result2 = await service.embed([text])
-    assert result1 == result2
+async def test_close_is_idempotent_and_prevents_future_inference(tmp_path: Path) -> None:
+    """Service-owned inference resources have a safe explicit shutdown boundary."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service, _ = _make_loaded_service(artifact)
+
+    service.close()
+    service.close()
+
+    with pytest.raises(EmbeddingServiceError, match="Embedding inference failed"):
+        await service.embed(["alpha"])
 
 
 @pytest.mark.asyncio
-async def test_embed_raises_when_not_loaded() -> None:
-    """Calling embed before load raises EmbeddingServiceError."""
-    config = EmbeddingModelConfig(model_name_or_path="stub", allow_unverified=True)
-    service = EmbeddingService(config=config)
+async def test_embed_empty_input_needs_no_model_call(tmp_path: Path) -> None:
+    """Embedding an empty batch remains a cheap no-op after service creation."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service = EmbeddingService(config=_config(artifact), model_loader=lambda _: StubSentenceTransformer())
+
+    assert await service.embed([]) == []
+
+
+@pytest.mark.asyncio
+async def test_embed_raises_when_not_loaded(tmp_path: Path) -> None:
+    """Loading is explicit and cannot be bypassed by an injected loader."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service = EmbeddingService(config=_config(artifact), model_loader=lambda _: StubSentenceTransformer())
+
     with pytest.raises(EmbeddingServiceError, match="not loaded"):
         await service.embed(["test"])
 
 
-def test_dimension_property() -> None:
-    """Dimension property returns configured value."""
-    service = _make_service()
-    assert service.dimension == 1024
+def test_embed_sync_supports_sentence_embedder_and_batches(tmp_path: Path) -> None:
+    """The synchronous protocol path shares the public loaded service state."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service, _ = _make_loaded_service(artifact, max_batch_size=2)
 
+    result = service.embed_sync(["a", "b", "c", "d", "e"])
 
-def test_model_digest_property() -> None:
-    """model_digest returns the computed digest."""
-    service = _make_service()
-    assert service.model_digest == "abc123"
-
-
-def test_embed_sync_for_sentence_embedder_protocol() -> None:
-    """embed_sync satisfies the SentenceEmbedder protocol from chunking_service."""
-    service = _make_service()
-    result = service.embed_sync(["sentence one", "sentence two"])
-    assert len(result) == 2
-    assert all(len(vec) == 1024 for vec in result)
-
-
-@pytest.mark.asyncio
-async def test_embed_batches_large_inputs() -> None:
-    """Inputs larger than max_batch_size are batched internally."""
-    config = EmbeddingModelConfig(
-        model_name_or_path="stub",
-        max_batch_size=2,
-        allow_unverified=True,
-    )
-    service = EmbeddingService(config=config)
-    service._model = StubSentenceTransformer("stub", 1024)
-    service._encode_fn = service._model.encode  # type: ignore[union-attr]
-    service._model_digest = "test"
-
-    texts = ["a", "b", "c", "d", "e"]
-    result = await service.embed(texts)
     assert len(result) == 5
+    assert all(len(vector) == 1024 for vector in result)

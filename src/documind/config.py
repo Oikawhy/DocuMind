@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     neo4j_auth_ref: str = ""
 
     # Embedding model
+    embedding_model_path: str = "/opt/documind/models/bge-m3"
     embedding_model_digest: str = ""
 
     # Temporal
