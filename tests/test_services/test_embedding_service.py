@@ -40,10 +40,23 @@ class StubSentenceTransformer:
 
     def __init__(self, dimension: int | None = 1024) -> None:
         self._dimension = dimension
-        self.encode = StubEncoder(dimension or 1024)
+        self.encoder_behavior = StubEncoder(dimension or 1024)
 
     def get_sentence_embedding_dimension(self) -> int | None:
         return self._dimension
+
+    def encode(
+        self,
+        texts: list[str],
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+    ) -> object:
+        """Delegate to a public behavior hook for service-boundary tests."""
+        return self.encoder_behavior(
+            texts,
+            normalize_embeddings=normalize_embeddings,
+            show_progress_bar=show_progress_bar,
+        )
 
 
 def _write_artifact(root: Path) -> Path:
@@ -76,9 +89,10 @@ def _make_loaded_service(
     *,
     dimension: int = 1024,
     max_batch_size: int = 32,
+    model: StubSentenceTransformer | None = None,
 ) -> tuple[EmbeddingService, list[Path]]:
     calls: list[Path] = []
-    model = StubSentenceTransformer(dimension)
+    model = model or StubSentenceTransformer(dimension)
 
     def loader(model_path: Path) -> StubSentenceTransformer:
         calls.append(model_path)
@@ -146,14 +160,15 @@ def test_config_rejects_non_contract_dimension(tmp_path: Path) -> None:
         )
 
 
-def test_config_rejects_non_positive_batch_size(tmp_path: Path) -> None:
-    """Batching cannot make forward progress with zero items per batch."""
+@pytest.mark.parametrize("max_batch_size", [0, 33, 1.5, True])
+def test_config_rejects_invalid_batch_size(tmp_path: Path, max_batch_size: object) -> None:
+    """Only whole batches in the supported range can reach model inference."""
     artifact = _write_artifact(tmp_path / "artifact")
     with pytest.raises(ValueError, match="max_batch_size"):
         EmbeddingModelConfig(
             model_path=artifact,
             expected_digest=_VALID_DIGEST,
-            max_batch_size=0,
+            max_batch_size=max_batch_size,  # type: ignore[arg-type]
         )
 
 
@@ -275,9 +290,75 @@ async def test_embed_returns_correct_dimension_and_preserves_order(tmp_path: Pat
     result = await service.embed(texts)
 
     assert len(result) == len(texts)
+    assert all(isinstance(vector, list) for vector in result)
     assert all(len(vector) == 1024 for vector in result)
+    assert all(type(value) is float for vector in result for value in vector)
     assert result[0] != result[1]
     assert result[1] != result[2]
+
+
+@pytest.mark.asyncio
+async def test_embed_rejects_cardinality_mismatch_from_model_output(tmp_path: Path) -> None:
+    """Each model batch must return exactly one vector for each input text."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    model = StubSentenceTransformer()
+    service, _ = _make_loaded_service(artifact, model=model)
+    model.encoder_behavior = lambda *_args, **_kwargs: [[0.0] * 1024]
+
+    with pytest.raises(
+        EmbeddingServiceError,
+        match=r"cardinality mismatch.*expected 2 vectors, got 1",
+    ):
+        await service.embed(["first", "second"])
+
+
+@pytest.mark.asyncio
+async def test_embed_rejects_non_1024_output_vector(tmp_path: Path) -> None:
+    """A model output vector must retain the fixed BGE-M3 contract dimension."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    model = StubSentenceTransformer()
+    service, _ = _make_loaded_service(artifact, model=model)
+    model.encoder_behavior = lambda *_args, **_kwargs: [[0.0] * 1023]
+
+    with pytest.raises(
+        EmbeddingServiceError,
+        match=r"vector at index 0.*1024 dimensions, got 1023",
+    ):
+        await service.embed(["first"])
+
+
+@pytest.mark.asyncio
+async def test_embed_rejects_non_finite_output_value(tmp_path: Path) -> None:
+    """NaN and infinity must not escape the embedding service boundary."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    model = StubSentenceTransformer()
+    service, _ = _make_loaded_service(artifact, model=model)
+    model.encoder_behavior = lambda *_args, **_kwargs: [[0.0] * 1023 + [float("nan")]]
+
+    with pytest.raises(
+        EmbeddingServiceError,
+        match=r"vector at index 0 dimension 1023.*finite",
+    ):
+        await service.embed(["first"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_value", [True, "not-a-number"], ids=["bool", "string"])
+async def test_embed_rejects_non_numeric_output_value(
+    tmp_path: Path,
+    invalid_value: object,
+) -> None:
+    """Only finite non-boolean integer and float values may leave the service."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    model = StubSentenceTransformer()
+    service, _ = _make_loaded_service(artifact, model=model)
+    model.encoder_behavior = lambda *_args, **_kwargs: [[0.0] * 1023 + [invalid_value]]
+
+    with pytest.raises(
+        EmbeddingServiceError,
+        match=r"vector at index 0 dimension 1023.*numeric",
+    ):
+        await service.embed(["first"])
 
 
 @pytest.mark.asyncio
@@ -337,9 +418,48 @@ async def test_embed_raises_when_not_loaded(tmp_path: Path) -> None:
 def test_embed_sync_supports_sentence_embedder_and_batches(tmp_path: Path) -> None:
     """The synchronous protocol path shares the public loaded service state."""
     artifact = _write_artifact(tmp_path / "artifact")
-    service, _ = _make_loaded_service(artifact, max_batch_size=2)
+    calls: list[list[str]] = []
+    model = StubSentenceTransformer()
 
-    result = service.embed_sync(["a", "b", "c", "d", "e"])
+    def encode_batch(texts: list[str], **_kwargs: object) -> list[list[float]]:
+        calls.append(texts)
+        return [[float(ord(text[0]))] * 1024 for text in texts]
+
+    service, _ = _make_loaded_service(artifact, max_batch_size=2, model=model)
+    model.encoder_behavior = encode_batch
+
+    result = service.embed_sync(["c", "a", "e", "b", "d"])
 
     assert len(result) == 5
     assert all(len(vector) == 1024 for vector in result)
+    assert calls == [["c", "a"], ["e", "b"], ["d"]]
+    assert [vector[0] for vector in result] == [99.0, 97.0, 101.0, 98.0, 100.0]
+
+
+def test_embed_sync_raises_not_loaded_error_without_assertion(tmp_path: Path) -> None:
+    """The synchronous compatibility path reports an unloaded model cleanly."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    service = EmbeddingService(config=_config(artifact), model_loader=lambda _: StubSentenceTransformer())
+
+    with pytest.raises(EmbeddingServiceError, match="not loaded"):
+        service.embed_sync(["test"])
+
+
+@pytest.mark.asyncio
+async def test_embed_and_embed_sync_wrap_encoder_failures_consistently(tmp_path: Path) -> None:
+    """The two public inference APIs expose the same domain-level encoder error."""
+    artifact = _write_artifact(tmp_path / "artifact")
+    model = StubSentenceTransformer()
+    service, _ = _make_loaded_service(artifact, model=model)
+
+    def fail_encoder(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("test encoder failure")
+
+    model.encoder_behavior = fail_encoder
+    with pytest.raises(EmbeddingServiceError) as async_error:
+        await service.embed(["test"])
+    with pytest.raises(EmbeddingServiceError) as sync_error:
+        service.embed_sync(["test"])
+
+    assert str(async_error.value) == "Embedding inference failed: test encoder failure"
+    assert str(sync_error.value) == str(async_error.value)

@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Protocol
 
@@ -119,9 +121,16 @@ class EmbeddingModelConfig:
             raise ValueError(
                 f"BGE-M3 contract requires dimension={_DEFAULT_DIMENSION}, got {self.dimension}"
             )
-        if self.max_batch_size < 1:
-            raise ValueError("max_batch_size must be at least 1")
+        if (
+            isinstance(self.max_batch_size, bool)
+            or not isinstance(self.max_batch_size, Integral)
+            or not 1 <= self.max_batch_size <= _MAX_BATCH_SIZE
+        ):
+            raise ValueError(
+                f"max_batch_size must be an integer between 1 and {_MAX_BATCH_SIZE}"
+            )
         object.__setattr__(self, "model_path", resolved_path)
+        object.__setattr__(self, "max_batch_size", int(self.max_batch_size))
 
 
 def _default_model_loader(model_path: Path) -> object:
@@ -218,16 +227,85 @@ class EmbeddingService:
         all_vectors: list[list[float]] = []
         for start in range(0, len(texts), self._config.max_batch_size):
             batch = texts[start : start + self._config.max_batch_size]
-            embeddings = self._encode_fn(
-                batch,
-                normalize_embeddings=self._config.normalize,
-                show_progress_bar=False,
-            )
-            for vector in embeddings:  # type: ignore[union-attr]
-                all_vectors.append(vector.tolist() if hasattr(vector, "tolist") else list(vector))
+            try:
+                embeddings = self._encode_fn(
+                    batch,
+                    normalize_embeddings=self._config.normalize,
+                    show_progress_bar=False,
+                )
+                all_vectors.extend(
+                    self._validate_batch_output(
+                        embeddings,
+                        expected_count=len(batch),
+                        batch_start=start,
+                    )
+                )
+            except EmbeddingServiceError:
+                raise
+            except Exception as exc:
+                raise EmbeddingServiceError(f"Embedding inference failed: {exc}") from exc
         return all_vectors
 
-    def embed_sync(self, sentences: list[str]) -> list[Sequence[float]]:
+    def _validate_batch_output(
+        self,
+        embeddings: object,
+        *,
+        expected_count: int,
+        batch_start: int,
+    ) -> list[list[float]]:
+        """Validate and normalize one model batch before exposing its vectors."""
+        try:
+            raw_vectors = list(embeddings)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise EmbeddingServiceError(
+                "Embedding output cardinality mismatch "
+                f"for batch starting at {batch_start}: expected {expected_count} vectors, "
+                "got a non-iterable result"
+            ) from exc
+
+        if len(raw_vectors) != expected_count:
+            raise EmbeddingServiceError(
+                "Embedding output cardinality mismatch "
+                f"for batch starting at {batch_start}: expected {expected_count} vectors, "
+                f"got {len(raw_vectors)}"
+            )
+
+        validated_vectors: list[list[float]] = []
+        for batch_index, raw_vector in enumerate(raw_vectors):
+            vector_index = batch_start + batch_index
+            tolist = getattr(raw_vector, "tolist", None)
+            vector_value = tolist() if callable(tolist) else raw_vector
+            try:
+                raw_values = list(vector_value)
+            except TypeError as exc:
+                raise EmbeddingServiceError(
+                    f"Embedding output vector at index {vector_index} must be an iterable"
+                ) from exc
+
+            if len(raw_values) != _DEFAULT_DIMENSION:
+                raise EmbeddingServiceError(
+                    f"Embedding output vector at index {vector_index} must have "
+                    f"{_DEFAULT_DIMENSION} dimensions, got {len(raw_values)}"
+                )
+
+            validated_vector: list[float] = []
+            for dimension, value in enumerate(raw_values):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise EmbeddingServiceError(
+                        f"Embedding output vector at index {vector_index} dimension {dimension} "
+                        "must be numeric"
+                    )
+                normalized_value = float(value)
+                if not math.isfinite(normalized_value):
+                    raise EmbeddingServiceError(
+                        f"Embedding output vector at index {vector_index} dimension {dimension} "
+                        "must be finite"
+                    )
+                validated_vector.append(normalized_value)
+            validated_vectors.append(validated_vector)
+        return validated_vectors
+
+    def embed_sync(self, sentences: list[str]) -> list[list[float]]:
         """Synchronous compatibility method for ``SentenceEmbedder`` callers."""
         return self._encode_sync(sentences)
 
