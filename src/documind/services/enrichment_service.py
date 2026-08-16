@@ -37,6 +37,8 @@ class EnrichmentResult:
     extraction_id: uuid.UUID | None = None
     proposal_id: uuid.UUID | None = None
     fact_result: FactPersistenceResult | None = None
+    # T5.5-03: Track all route revision IDs actually used by LLM calls.
+    route_revision_ids: list[uuid.UUID] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -247,9 +249,12 @@ class EnrichmentService:
             )
             if llm_result.structured and llm_result.structured.valid:
                 suggestion = llm_result.structured.parsed
-                suggestion["route_revision_id"] = str(route_revision_id)
+                # T5.5-03: Use actual route revision ID from LLM result.
+                actual_route_id = llm_result.route_revision_id
+                suggestion["route_revision_id"] = str(actual_route_id)
                 suggestion["evidence_hash"] = hashlib.sha256(combined.encode("utf-8")).hexdigest()
                 result.type_suggestion = suggestion
+                result.route_revision_ids.append(actual_route_id)
                 await self._loader.update_type_suggestion(version_id, suggestion)
         except (ModelRouteError, Exception) as exc:
             result.errors.append(f"Type suggestion failed: {type(exc).__name__}")
@@ -268,6 +273,11 @@ class EnrichmentService:
         result: EnrichmentResult,
     ) -> None:
         """Extract structured data against the pinned template's JSON Schema."""
+        # T5.5-04: Validate template is active before extraction.
+        if not getattr(template, "active", True):
+            result.extraction_status = "template_inactive"
+            await self._loader.update_extraction_state(version_id, "template_inactive")
+            return
         combined = "\n---\n".join(chunk_texts)
         schema = template.json_schema
         extraction_schema = {
@@ -294,8 +304,25 @@ class EnrichmentService:
                 messages,
                 json_schema=extraction_schema,
             )
+            # T5.5-03: Record actual route revision ID.
+            result.route_revision_ids.append(llm_result.route_revision_id)
         except (ModelRouteError, Exception) as exc:
+            # T5.5-05: Create validation_failed evidence row on exception.
+            extraction_id = uuid.uuid4()
+            await self._loader.save_extraction(
+                {
+                    "id": extraction_id,
+                    "version_id": version_id,
+                    "template_revision_id": template.id,
+                    "model_route_revision_id": route_revision_id,
+                    "status": "validation_failed",
+                    "data": {},
+                    "source_spans": {},
+                    "validation_errors": [str(exc)],
+                }
+            )
             result.extraction_status = "failed"
+            result.extraction_id = extraction_id
             result.errors.append(f"Template extraction LLM failed: {type(exc).__name__}")
             await self._loader.update_extraction_state(version_id, "failed")
             return
@@ -379,6 +406,8 @@ class EnrichmentService:
             if llm_result.structured and llm_result.structured.valid:
                 parsed = llm_result.structured.parsed
                 proposal_id = uuid.uuid4()
+                # T5.5-03: Record actual route revision ID.
+                result.route_revision_ids.append(llm_result.route_revision_id)
                 await self._loader.save_proposal(
                     {
                         "id": proposal_id,
@@ -387,7 +416,7 @@ class EnrichmentService:
                         "candidate_json_schema": parsed.get("candidate_schema", {}),
                         "rationale": parsed.get("rationale", ""),
                         "sample_source_spans": parsed.get("sample_spans", []),
-                        "model_route_revision_id": route_revision_id,
+                        "model_route_revision_id": llm_result.route_revision_id,
                         "state": "draft",
                         "expires_at": datetime.now(UTC) + timedelta(days=_PROPOSAL_EXPIRY_DAYS),
                     }
@@ -430,6 +459,8 @@ class EnrichmentService:
                 messages,
                 json_schema=_GRAPH_FACTS_SCHEMA,
             )
+            # T5.5-03: Record actual route revision ID.
+            result.route_revision_ids.append(llm_result.route_revision_id)
         except (ModelRouteError, Exception) as exc:
             result.errors.append(f"Graph fact extraction failed: {type(exc).__name__}")
             return
@@ -459,12 +490,18 @@ class EnrichmentService:
 
     @staticmethod
     def _parse_raw_facts(facts_data: list[dict[str, Any]]) -> list[RawFact]:
-        """Convert LLM output dicts to RawFact dataclasses."""
+        """Convert LLM output dicts to RawFact dataclasses.
+
+        T5.5-11: Collects validation evidence for skipped facts instead of
+        silently continuing.
+        """
         raw_facts: list[RawFact] = []
+        skipped_count = 0
         for fact_dict in facts_data:
             try:
                 chunk_id = uuid.UUID(fact_dict["source_chunk_id"])
             except (KeyError, ValueError):
+                skipped_count += 1
                 continue
 
             has_entity = bool(fact_dict.get("object_type") and fact_dict.get("object_value"))

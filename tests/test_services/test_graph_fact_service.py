@@ -87,7 +87,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="WORKS_AT",
+            predicate_key="works_at",
             object_entity_type="ORG",
             object_display_value="Acme Corp",
             source_chunk_id=CHUNK_ID_1,
@@ -100,7 +100,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="CONTRACT",
             subject_display_value="Agreement #123",
-            predicate_key="HAS_VALUE",
+            predicate_key="has_value",
             object_literal_type="currency",
             object_literal_unit="USD",
             object_literal_value="50000",
@@ -113,7 +113,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="HAS_VALUE",
+            predicate_key="has_value",
             object_entity_type="ORG",
             object_display_value="Acme",
             object_literal_type="currency",
@@ -128,7 +128,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             source_chunk_id=CHUNK_ID_1,
             confidence=0.5,
         )
@@ -139,7 +139,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=CHUNK_ID_1,
@@ -152,7 +152,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=CHUNK_ID_1,
@@ -178,7 +178,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=None,
@@ -192,7 +192,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=foreign_chunk,
@@ -205,7 +205,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=CHUNK_ID_1,
@@ -218,7 +218,7 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=CHUNK_ID_1,
@@ -231,20 +231,34 @@ class TestValidateRawFact:
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=CHUNK_ID_1,
             confidence=0.0,
         )
-        # Should not raise — boundary is inclusive
+        # T5.5-08: 0.0 is below the 0.3 persistence floor
+        with pytest.raises(GraphFactValidationError, match="persistence floor"):
+            GraphFactService._validate_raw_fact(raw, {CHUNK_ID_1})
+
+    def test_confidence_boundary_at_floor(self):
+        raw = RawFact(
+            subject_entity_type="PERSON",
+            subject_display_value="Alice",
+            predicate_key="knows",
+            object_entity_type="PERSON",
+            object_display_value="Bob",
+            source_chunk_id=CHUNK_ID_1,
+            confidence=0.3,
+        )
+        # Should not raise — 0.3 is at the floor
         GraphFactService._validate_raw_fact(raw, {CHUNK_ID_1})
 
     def test_confidence_boundary_one(self):
         raw = RawFact(
             subject_entity_type="PERSON",
             subject_display_value="Alice",
-            predicate_key="KNOWS",
+            predicate_key="knows",
             object_entity_type="PERSON",
             object_display_value="Bob",
             source_chunk_id=CHUNK_ID_1,

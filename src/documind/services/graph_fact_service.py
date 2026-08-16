@@ -231,11 +231,22 @@ class GraphFactService:
 
     @staticmethod
     def _validate_raw_fact(raw: RawFact, chunk_ids: set[uuid.UUID]) -> None:
-        """Validate a raw fact before normalization."""
+        """Validate a raw fact before normalization.
+
+        T5.5-08: Confidence floor of 0.3 for persistence.
+        T5.5-09: Predicate key validation.
+        T5.5-10: Evidence span length cap.
+        """
         if not raw.subject_entity_type or not raw.subject_display_value:
             raise GraphFactValidationError("Subject entity type and display value are required.")
         if not raw.predicate_key:
             raise GraphFactValidationError("Predicate key is required.")
+
+        # T5.5-09: Predicate key must be snake_case alphanumeric.
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", raw.predicate_key):
+            raise GraphFactValidationError(
+                f"Predicate key '{raw.predicate_key}' must be snake_case (a-z, 0-9, _), max 64 chars."
+            )
 
         has_entity = bool(raw.object_entity_type and raw.object_display_value)
         has_literal = raw.object_literal_type is not None and raw.object_literal_value is not None
@@ -250,8 +261,18 @@ class GraphFactService:
         if not (0.0 <= raw.confidence <= 1.0):
             raise GraphFactValidationError(f"Confidence must be between 0 and 1, got {raw.confidence}.")
 
+        # T5.5-08: Confidence floor — skip low-confidence facts.
+        if raw.confidence < 0.3:
+            raise GraphFactValidationError(f"Confidence {raw.confidence} is below the 0.3 persistence floor.")
+
         if raw.evidence_span is not None and not raw.evidence_span.strip():
             raise GraphFactValidationError("evidence_span is blank after stripping whitespace.")
+
+        # T5.5-10: Evidence span length cap.
+        if raw.evidence_span is not None and len(raw.evidence_span) > 500:
+            raise GraphFactValidationError(
+                f"evidence_span length {len(raw.evidence_span)} exceeds the 500-character cap."
+            )
 
     async def _upsert_entity(
         self,
