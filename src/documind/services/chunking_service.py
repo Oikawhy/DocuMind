@@ -194,7 +194,7 @@ class ChunkingService:
             0,
             len(text),
             profile.target_tokens,
-            ("\n\n", "\n", ". ", "! ", "? ", " "),
+            ("\n\n", "\n", ". ", "! ", "? ", " ", ""),
         )
         return self._pack_units(units, tokens, profile)
 
@@ -262,9 +262,13 @@ class ChunkingService:
             for span in spans[1:]:
                 start, end, count = span
                 if count < min_tok:
-                    # Attach to previous span
+                    # Attach to previous span only if merge doesn't exceed max
                     prev_start, _, _ = merged[-1]
-                    merged[-1] = (prev_start, end, self._span_token_count(tokens, prev_start, end))
+                    merged_count = self._span_token_count(tokens, prev_start, end)
+                    if merged_count <= maximum:
+                        merged[-1] = (prev_start, end, merged_count)
+                    else:
+                        merged.append(span)
                 else:
                     merged.append(span)
             # Also check if the last span is too short
@@ -273,8 +277,11 @@ class ChunkingService:
                 if last_count < min_tok:
                     prev_start, _, _ = merged[-2]
                     last_end = merged[-1][1]
-                    merged[-2] = (prev_start, last_end, self._span_token_count(tokens, prev_start, last_end))
-                    merged.pop()
+                    merged_count = self._span_token_count(tokens, prev_start, last_end)
+                    # T5.3-06: Only merge if result doesn't exceed maximum
+                    if merged_count <= maximum:
+                        merged[-2] = (prev_start, last_end, merged_count)
+                        merged.pop()
             return merged
 
         return spans
@@ -460,6 +467,15 @@ class ChunkingService:
             raise ChunkingError("The selected chunk profile has no embedding model digest.")
         if profile.strategy == "vector" and profile.recursive_fallback_revision_id is None:
             raise ChunkingError("A vector profile must have a recursive_fallback_revision_id.")
+        # T5.3-05: Enforce 100–1024 token range for vector and paragraph modes.
+        if profile.strategy in ("vector", "paragraph"):
+            effective_min = profile.min_tokens
+            effective_max = profile.max_tokens or profile.target_tokens
+            if effective_min < 100 or effective_max > 1024:
+                raise ChunkingError(
+                    f"Vector/paragraph profile must use 100-1024 token range, "
+                    f"got {effective_min}-{effective_max}."
+                )
 
     @staticmethod
     def _validate_normalized_document(normalized: NormalizedDocument) -> None:
@@ -534,6 +550,8 @@ class ChunkingService:
             page_start=page_start,
             page_end=page_end,
             section_path=list(covered_blocks[0].section_path) if covered_blocks else [],
+            # T5.3-08: Store all unique section paths, not just the first.
+            section_paths=_unique_section_paths(covered_blocks),
             block_ids=tuple(block.block_id for block in covered_blocks),
             token_count=token_count,
             profile_revision_id=profile.revision_id,
@@ -571,6 +589,27 @@ class ChunkingService:
             else:
                 result.append((start_offset, end_offset))
         return result
+
+
+# ---------------------------------------------------------------------------
+# Section path helpers
+# ---------------------------------------------------------------------------
+
+
+def _unique_section_paths(covered_blocks: list[NormalizedBlock]) -> list[list[str]]:
+    """Return unique section paths in reading order from covered blocks.
+
+    T5.3-08: Preserves all unique section paths covered by a chunk, not just
+    the first block's path.
+    """
+    seen: set[tuple[str, ...]] = set()
+    paths: list[list[str]] = []
+    for block in covered_blocks:
+        path_tuple = tuple(block.section_path)
+        if path_tuple not in seen:
+            seen.add(path_tuple)
+            paths.append(list(block.section_path))
+    return paths
 
 
 # ---------------------------------------------------------------------------

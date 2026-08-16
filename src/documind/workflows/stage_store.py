@@ -628,7 +628,7 @@ class PostgresChunkProfileSource:
                 "strategy": config.get("strategy", "fixed"),
                 "tokenizer_digest": config.get("tokenizer_digest", ""),
                 "target_tokens": config.get("target_tokens", 512),
-                "overlap_tokens": config.get("overlap_tokens", 0),
+                "overlap_tokens": config.get("overlap_tokens", 50),
                 "embedding_model_digest": config.get("embedding_model_digest", ""),
                 "active": profile.status.value == "active" if hasattr(profile.status, "value") else True,
                 "min_tokens": config.get("min_tokens", 1),

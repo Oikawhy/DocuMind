@@ -37,6 +37,7 @@ class DocumentChunk(Base):
     page_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
     page_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
     section_path: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    section_paths: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     block_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     profile_revision_id: Mapped[uuid.UUID] = mapped_column(

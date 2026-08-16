@@ -109,6 +109,7 @@ async def chunk(stage: StageExecution) -> dict[str, Any]:
         result = await writer.write_chunks(version_id, profile.revision_id, chunks)
         # Include profile/effective-profile and chunk count/checksum in output
         result.setdefault("profile_revision_id", str(profile.revision_id))
+        result.setdefault("effective_profile_revision_id", str(profile.revision_id))
         result.setdefault("effective_profile_strategy", profile.strategy)
         result.setdefault("tokenizer_digest", profile.tokenizer_digest)
         result.setdefault("embedding_model_digest", profile.embedding_model_digest)
@@ -156,7 +157,7 @@ def _build_chunk_profile(normalization: dict[str, Any]) -> ChunkProfile:
         strategy=profile_data.get("strategy", "fixed"),
         tokenizer_digest=profile_data.get("tokenizer_digest", ""),
         target_tokens=profile_data.get("target_tokens", 512),
-        overlap_tokens=profile_data.get("overlap_tokens", 0),
+        overlap_tokens=profile_data.get("overlap_tokens", 50),
         embedding_model_digest=profile_data.get("embedding_model_digest", ""),
         active=profile_data.get("active", True),
         min_tokens=profile_data.get("min_tokens", 1),
