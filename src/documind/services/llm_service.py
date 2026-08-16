@@ -46,6 +46,9 @@ ROLE_LIMITS: dict[ModelRole, RoleLimits] = {
     ModelRole.VLM: RoleLimits(temperature=0.0, max_output_tokens=4096, timeout_seconds=60, enabled=False),
 }
 
+#: External cloud providers that require a secret_reference.
+_CLOUD_PROVIDERS = frozenset({"openai", "anthropic", "azure", "cohere", "google"})
+
 
 @dataclass(frozen=True)
 class ModelRoute:
@@ -400,7 +403,6 @@ class LLMService:
         if route.max_attempts <= 0:
             raise ModelRouteError("Route max_attempts must be positive.")
         # T5.4-02: External cloud providers must have a secret_reference.
-        _CLOUD_PROVIDERS = {"openai", "anthropic", "azure", "cohere", "google"}
         if route.provider_kind in _CLOUD_PROVIDERS and not route.secret_reference:
             raise ModelRouteError("External provider route requires a secret reference.")
 

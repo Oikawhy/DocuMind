@@ -189,12 +189,11 @@ class NormalizedDocumentSource:
             raise NormalizationIntegrityError("Missing or invalid normalization_revision.")
 
         # T5.2-01: Cross-check normalization revision against version metadata.
-        if expected_normalization_revision is not None:
-            if normalization_revision != expected_normalization_revision:
-                raise NormalizationIntegrityError(
-                    f"Normalization revision mismatch: expected '{expected_normalization_revision}', "
-                    f"got '{normalization_revision}'."
-                )
+        if expected_normalization_revision is not None and normalization_revision != expected_normalization_revision:
+            raise NormalizationIntegrityError(
+                f"Normalization revision mismatch: expected '{expected_normalization_revision}', "
+                f"got '{normalization_revision}'."
+            )
 
         # T5.2-02: Require blocks — reject missing values.
         raw_blocks = payload.get("blocks")
