@@ -265,8 +265,11 @@ class LLMService:
                     "safe_error_class": safe_error_class,
                 }
                 await self._audit_sink.record(error_audit)
+            # T5.4-05: Wrap provider exceptions in ModelRouteError.
             if last_exc is not None:
-                raise last_exc
+                raise ModelRouteError(
+                    f"Model invocation failed for role {role.value}: {type(last_exc).__name__}"
+                ) from last_exc
             raise ModelRouteError(f"Adapter returned no response for role {role.value}.")
 
         # 8. Handle structured output
@@ -330,6 +333,21 @@ class LLMService:
                         repair_succeeded=False,
                     )
                 if not structured.valid:
+                    # T5.4-06: Emit audit before raising on structured-output exhaustion.
+                    exhaustion_audit = {
+                        "route_revision_id": str(route.revision_id),
+                        "model_digest": route.model_digest,
+                        "model_alias": route.model_alias,
+                        "consent_id": str(route.external_consent_id) if route.external_consent_id else None,
+                        "input_hash": hashlib.sha256(str(messages).encode("utf-8")).hexdigest(),
+                        "output_hash": hashlib.sha256(response.content.encode("utf-8")).hexdigest(),
+                        "input_tokens": response.input_tokens,
+                        "output_tokens": response.output_tokens,
+                        "latency_ms": round(latency_ms, 2),
+                        "safe_error_class": "StructuredOutputExhausted",
+                    }
+                    if self._audit_sink is not None:
+                        await self._audit_sink.record(exhaustion_audit)
                     raise ModelRouteError(f"Structured output exhausted after repair for role {role.value}.")
 
         # 9. Build content-free audit record
@@ -381,13 +399,21 @@ class LLMService:
             raise ModelRouteError("Route timeout must be positive.")
         if route.max_attempts <= 0:
             raise ModelRouteError("Route max_attempts must be positive.")
+        # T5.4-02: External cloud providers must have a secret_reference.
+        _CLOUD_PROVIDERS = {"openai", "anthropic", "azure", "cohere", "google"}
+        if route.provider_kind in _CLOUD_PROVIDERS and not route.secret_reference:
+            raise ModelRouteError("External provider route requires a secret reference.")
 
     @staticmethod
     def _parse_structured_output(
         content: str,
         json_schema: dict[str, Any],
     ) -> StructuredOutputResult:
-        """Parse JSON content and validate against the supplied schema."""
+        """Parse JSON content and validate against the supplied schema.
+
+        T5.4-03: Uses ``jsonschema`` for Draft 2020-12 validation instead of
+        hand-written property/type checks.
+        """
         import json as json_module
 
         try:
@@ -398,39 +424,18 @@ class LLMService:
         if not isinstance(parsed, dict):
             return StructuredOutputResult(parsed={}, valid=False)
 
-        # Basic schema validation: check required keys exist
-        required_keys = json_schema.get("required", [])
-        properties = json_schema.get("properties", {})
-        if required_keys:
-            missing = [key for key in required_keys if key not in parsed]
-            if missing:
-                return StructuredOutputResult(parsed=parsed, valid=False)
+        try:
+            import jsonschema
 
-        # Check property types match schema when properties are specified
-        if properties:
-            for key, prop_schema in properties.items():
-                if key in parsed:
-                    expected_type = prop_schema.get("type")
-                    if expected_type and not _json_type_matches(parsed[key], expected_type):
-                        return StructuredOutputResult(parsed=parsed, valid=False)
+            jsonschema.validate(parsed, json_schema)
+        except ImportError:
+            # Fallback: basic required-key check if jsonschema not installed
+            required_keys = json_schema.get("required", [])
+            if required_keys:
+                missing = [key for key in required_keys if key not in parsed]
+                if missing:
+                    return StructuredOutputResult(parsed=parsed, valid=False)
+        except jsonschema.ValidationError:
+            return StructuredOutputResult(parsed=parsed, valid=False)
 
         return StructuredOutputResult(parsed=parsed, valid=True)
-
-
-def _json_type_matches(value: Any, json_type: str) -> bool:
-    """Check if a Python value matches a JSON schema type."""
-    type_map: dict[str, type | tuple[type, ...]] = {
-        "string": str,
-        "integer": int,
-        "number": (int, float),
-        "boolean": bool,
-        "array": list,
-        "object": dict,
-    }
-    expected = type_map.get(json_type)
-    if expected is None:
-        return True  # Unknown type, pass through
-    # JSON booleans are not integers in schema terms
-    if json_type == "integer" and isinstance(value, bool):
-        return False
-    return isinstance(value, expected)
