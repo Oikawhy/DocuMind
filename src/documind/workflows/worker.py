@@ -198,7 +198,9 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
     )
 
     # Configure ingest-cpu activities: inspect, parse, normalize, chunk
-    configure_inspection_activity(scanner, tombstone_guard=stage_store, stage_store=stage_store)
+    configure_inspection_activity(
+        scanner, tombstone_guard=stage_store, stage_store=stage_store, storage_service=storage,
+    )
     configure_parse_activity(ocr, tombstone_guard=stage_store, stage_store=stage_store)
     configure_normalize_activity(processing, tombstone_guard=stage_store, stage_store=stage_store)
 
@@ -246,6 +248,7 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
         redis_client=redis_client,
         temporal_client=temporal_client,
         run_recorder=stage_store,
+        lifecycle_checker=stage_store,
     )
     stream_runner = RedisStreamWorkflowRunner(redis_client=redis_client, consumer=consumer)
 

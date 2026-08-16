@@ -24,6 +24,7 @@ class TombstoneGuard(Protocol):
 _scanner_service: ScannerService | None = None
 _tombstone_guard: TombstoneGuard | None = None
 _stage_store: StageReplayStore | None = None
+_storage_service: Any = None  # G-01: StorageService for quarantine→accepted promotion
 
 
 def configure_inspection_activity(
@@ -31,12 +32,14 @@ def configure_inspection_activity(
     *,
     tombstone_guard: TombstoneGuard | None = None,
     stage_store: StageReplayStore,
+    storage_service: Any = None,
 ) -> None:
     """Inject worker-owned dependencies; no client or credentials live in a workflow."""
-    global _scanner_service, _stage_store, _tombstone_guard
+    global _scanner_service, _stage_store, _tombstone_guard, _storage_service
     _scanner_service = scanner_service
     _tombstone_guard = tombstone_guard
     _stage_store = stage_store
+    _storage_service = storage_service
 
 
 @activity.defn(name="inspect")
@@ -48,8 +51,47 @@ async def inspect(stage: StageExecution) -> dict[str, Any]:
     await _assert_active(stage)
 
     async def execute() -> dict[str, Any]:
-        result = await scanner.inspect(__import__("uuid").UUID(stage.version_id))
-        return asdict(result)
+        import uuid as _uuid
+
+        version_id = _uuid.UUID(stage.version_id)
+        result = await scanner.inspect(version_id)
+        output = asdict(result)
+
+        # G-19: Persist inspection evidence for the audit trail regardless of verdict.
+        if _storage_service is not None:
+            try:
+                await _storage_service.write_evidence(
+                    version_id,
+                    stage="inspect",
+                    attempt=1,
+                    payload={
+                        "version_id": str(version_id),
+                        "safe": result.safe,
+                        "detected_mime": result.detected_mime,
+                        "safe_error_class": result.safe_error_class,
+                        "safe_error_code": result.safe_error_code,
+                        "safe_message": result.safe_message,
+                        "archive_members": result.archive_members,
+                    },
+                )
+            except Exception:
+                pass  # Evidence is best-effort; don't block the inspection result.
+
+        # G-01: Promote quarantine → accepted after a safe inspection.
+        if result.safe and _storage_service is not None:
+            quarantine_key = _storage_service.quarantine_key(version_id)
+            # Build accepted key using version_id as document_id placeholder
+            # (the real document_id/version_number come from the DB but
+            # the content_sha256 is unknown here; use a simplified key).
+            accepted_key = f"accepted/{version_id}/original"
+            try:
+                await _storage_service.move_to_accepted(quarantine_key, accepted_key)
+                output["accepted_object_key"] = accepted_key
+            except Exception:
+                # Non-fatal: downstream stages will still find the quarantine key.
+                pass
+
+        return output
 
     async with _heartbeat_loop(stage):
         output = await _run_stage(stage, execute, max_attempts=3)

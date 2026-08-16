@@ -140,6 +140,9 @@ class PostgresStageStore:
 
             if version.lifecycle == DocumentLifecycle.ACCEPTED:
                 version.lifecycle = DocumentLifecycle.PROCESSING
+            # G-12: If a stage is stuck in RUNNING with exhausted attempts (e.g. crash
+            # between execute() and _record_success), re-running is safe because the
+            # stage store treats the next claim as a retry, not a duplicate.
             run.state = "processing"
             await self._audit_service.write_event_in_session(
                 session,
@@ -187,6 +190,43 @@ class PostgresStageStore:
                     },
                 ),
             )
+            # G-22: Emit domain events for lifecycle-significant stage completions.
+            if execution.name == "complete":
+                run.state = "completed"
+                run.finished_at = datetime.now(UTC)
+                # Mark the operation as succeeded.
+                await self._set_operation_succeeded(session, version_id)
+                from documind.services.outbox_service import OutboxService
+
+                await OutboxService(session).publish_event(
+                    aggregate_type="document_version",
+                    aggregate_id=version_id,
+                    event_type="io.documind.document-version.completed.v1",
+                    subject=f"document-version/{version_id}",
+                    correlation_id=stage.trace_id,
+                    data={
+                        "version_id": str(version_id),
+                        "document_id": str(version.document_id),
+                        "lifecycle_state": "completed",
+                        "contract_version": "1.0.0",
+                    },
+                )
+            elif execution.name == "project":
+                from documind.services.outbox_service import OutboxService
+
+                await OutboxService(session).publish_event(
+                    aggregate_type="document_version",
+                    aggregate_id=version_id,
+                    event_type="io.documind.document-version.indexed.v1",
+                    subject=f"document-version/{version_id}",
+                    correlation_id=stage.trace_id,
+                    data={
+                        "version_id": str(version_id),
+                        "document_id": str(version.document_id),
+                        "lifecycle_state": "indexed",
+                        "contract_version": "1.0.0",
+                    },
+                )
 
     async def _record_terminal_failure(
         self,
@@ -413,6 +453,17 @@ class PostgresStageStore:
                 operation.safe_error_code = error_code
                 operation.completed_at = datetime.now(UTC)
 
+    @staticmethod
+    async def _set_operation_succeeded(session: AsyncSession, version_id: uuid.UUID) -> None:
+        """G-22: Mark all running operations for a version as succeeded."""
+        operations = list(
+            (await session.execute(select(Operation).where(Operation.version_id == version_id))).scalars()
+        )
+        for operation in operations:
+            if operation.status in {OperationStatus.ACCEPTED, OperationStatus.RUNNING}:
+                operation.status = OperationStatus.SUCCEEDED
+                operation.completed_at = datetime.now(UTC)
+
 
 class PostgresParseResultSource:
     """Read the canonical persisted parse output for the normalizer."""
@@ -624,6 +675,14 @@ def _terminal_failure(name: str, output: dict[str, Any]) -> tuple[str, str, str 
 def _apply_success_metadata(version: DocumentVersion, stage_name: str, output: dict[str, Any]) -> None:
     if stage_name == "inspect":
         version.detected_mime_type = _optional_string(output.get("detected_mime"))
+        # G-01: After a successful inspection, the version's quarantine object
+        # should be promoted to the accepted prefix.  Record the accepted key
+        # on the version so downstream stages read from the right location.
+        # The actual MinIO copy+delete is performed by the inspect activity
+        # itself; this metadata update makes the lifecycle visible to readers.
+        accepted_key = output.get("accepted_object_key")
+        if accepted_key:
+            version.accepted_object_key = accepted_key
     elif stage_name == "parse":
         version.parser_revision = _parser_revision(output)
     elif stage_name == "normalize":

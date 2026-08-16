@@ -114,6 +114,9 @@ class ClamAVTCPClient:
         verdict = response.decode("utf-8", errors="replace").strip("\x00\r\n ")
         if not verdict or "ERROR" in verdict.upper():
             raise ScannerUnavailableError("Malware scanner did not return a usable verdict.")
+        # G-14: Fail-closed — only the exact clamd safe response passes.
+        if not verdict.endswith("OK"):
+            raise ScannerUnavailableError("Malware scanner returned an unrecognized verdict.")
         return verdict
 
 
@@ -175,7 +178,8 @@ class ScannerService:
         except (TimeoutError, OSError) as exc:
             raise ScannerUnavailableError("Malware scanner is unavailable.") from exc
 
-        if "OK" not in verdict.upper() or "FOUND" in verdict.upper():
+        # G-14: Fail-closed verdict check — reject unless the exact safe pattern matches.
+        if "FOUND" in verdict.upper() or not verdict.endswith("OK"):
             return _rejected(
                 version_id,
                 detected_mime,
@@ -312,8 +316,9 @@ def _rejected(
 # ---------------------------------------------------------------------------
 _MAX_PDF_PAGES = 5_000
 _MAX_PDF_OBJECTS = 100_000
-_MAX_IMAGE_PIXELS = 200_000_000
+_MAX_IMAGE_PIXELS = 100_000_000  # G-16: spec §5.3 requires 100M, not 200M
 _MAX_XML_ENTITY_EXPANSIONS = 10_000
+_MAX_TIFF_FRAMES = 100  # G-16: limit TIFF IFD frames to prevent decode-memory bombs
 
 
 def _preflight_validate(
@@ -340,9 +345,10 @@ def _preflight_pdf(
 ) -> InspectionResult | None:
     """Reject encrypted PDFs and those exceeding page/object safety limits."""
     try:
-        # Quick header-level checks without a full parser dependency.
-        header = payload[:1024].decode("latin-1", errors="replace")
-        if "/Encrypt" in header:
+        # G-15: Search the full file for /Encrypt, not just the first 1 KiB.
+        # The encryption dictionary reference in valid PDFs normally appears in
+        # the trailer near the end of the file.
+        if b"/Encrypt" in payload:
             return _rejected(
                 version_id, detected_mime,
                 error_class="unsafe_content",
@@ -390,12 +396,12 @@ def _preflight_ooxml(
                         error_code="OOXML_MACRO_DETECTED",
                         message="Office documents containing macros are not supported.",
                     )
-            # Check for external relationships.
+            # G-17: Check for external relationships — handle both double and single quotes.
             for name in archive.namelist():
                 if name.endswith(".rels"):
                     try:
                         rels_content = archive.read(name).decode("utf-8", errors="replace")
-                        if 'TargetMode="External"' in rels_content:
+                        if 'TargetMode="External"' in rels_content or "TargetMode='External'" in rels_content:
                             return _rejected(
                                 version_id, detected_mime,
                                 error_class="unsafe_content",
@@ -414,11 +420,14 @@ def _preflight_xml(
     version_id: uuid.UUID,
     detected_mime: str,
 ) -> InspectionResult | None:
-    """Reject XML with entity expansion or remote directives."""
+    """Reject XML/HTML with entity expansion, remote directives, or active content."""
     try:
-        text = payload[:8192].decode("utf-8", errors="replace")
+        # G-17: Scan the full payload, not just the first 8 KiB.
+        text = payload.decode("utf-8", errors="replace")
+        upper_text = text.upper()
+
         # Check for DOCTYPE declarations with entity definitions.
-        if "<!DOCTYPE" in text.upper() and "<!ENTITY" in text.upper():
+        if "<!DOCTYPE" in upper_text and "<!ENTITY" in upper_text:
             return _rejected(
                 version_id, detected_mime,
                 error_class="unsafe_content",
@@ -426,13 +435,36 @@ def _preflight_xml(
                 message="XML documents with entity declarations are not supported.",
             )
         # Check for external DTD references.
-        if "SYSTEM" in text and "<!DOCTYPE" in text.upper():
+        if "SYSTEM" in text and "<!DOCTYPE" in upper_text:
             return _rejected(
                 version_id, detected_mime,
                 error_class="unsafe_content",
                 error_code="XML_EXTERNAL_DTD",
                 message="XML documents with external DTD references are not supported.",
             )
+        # Check for PUBLIC identifier (another external DTD vector).
+        if "PUBLIC" in text and "<!DOCTYPE" in upper_text:
+            return _rejected(
+                version_id, detected_mime,
+                error_class="unsafe_content",
+                error_code="XML_EXTERNAL_DTD",
+                message="XML documents with external DTD references are not supported.",
+            )
+        # G-17: HTML active content detection for text/html.
+        if detected_mime == "text/html":
+            _HTML_ACTIVE_TAGS = (
+                "<SCRIPT", "<IFRAME", "<OBJECT", "<EMBED", "<APPLET",
+                "<LINK ",  # trailing space to avoid matching <LINK> as self-closing void
+                "JAVASCRIPT:", "DATA:TEXT/HTML",
+            )
+            for tag in _HTML_ACTIVE_TAGS:
+                if tag in upper_text:
+                    return _rejected(
+                        version_id, detected_mime,
+                        error_class="unsafe_content",
+                        error_code="HTML_ACTIVE_CONTENT",
+                        message="HTML documents with active content are not supported.",
+                    )
     except Exception:
         pass
     return None
@@ -478,6 +510,66 @@ def _preflight_image(
                     break
                 seg_len = _struct.unpack(">H", payload[offset + 2 : offset + 4])[0]
                 offset += 2 + seg_len
+        elif detected_mime == "image/tiff":
+            # G-16: TIFF dimension and frame-count checks.
+            # TIFF starts with byte-order indicator (II or MM) then magic 42.
+            if len(payload) < 8:
+                return None
+            if payload[:2] == b"II":
+                endian = "<"
+            elif payload[:2] == b"MM":
+                endian = ">"
+            else:
+                return None
+            magic = _struct.unpack(f"{endian}H", payload[2:4])[0]
+            if magic != 42:
+                return None
+            ifd_offset = _struct.unpack(f"{endian}I", payload[4:8])[0]
+            frame_count = 0
+            visited_offsets: set[int] = set()
+            while ifd_offset > 0 and ifd_offset < len(payload) - 2 and ifd_offset not in visited_offsets:
+                visited_offsets.add(ifd_offset)
+                frame_count += 1
+                if frame_count > _MAX_TIFF_FRAMES:
+                    return _rejected(
+                        version_id, detected_mime,
+                        error_class="unsafe_content",
+                        error_code="IMAGE_FRAME_LIMIT",
+                        message="The TIFF exceeds the maximum frame count.",
+                    )
+                entry_count = _struct.unpack(f"{endian}H", payload[ifd_offset:ifd_offset + 2])[0]
+                # Look for ImageWidth (tag 256) and ImageLength (tag 257)
+                width = 0
+                height = 0
+                pos = ifd_offset + 2
+                for _ in range(entry_count):
+                    if pos + 12 > len(payload):
+                        break
+                    tag = _struct.unpack(f"{endian}H", payload[pos:pos + 2])[0]
+                    field_type = _struct.unpack(f"{endian}H", payload[pos + 2:pos + 4])[0]
+                    if tag == 256:  # ImageWidth
+                        if field_type == 3:  # SHORT
+                            width = _struct.unpack(f"{endian}H", payload[pos + 8:pos + 10])[0]
+                        else:  # LONG
+                            width = _struct.unpack(f"{endian}I", payload[pos + 8:pos + 12])[0]
+                    elif tag == 257:  # ImageLength
+                        if field_type == 3:
+                            height = _struct.unpack(f"{endian}H", payload[pos + 8:pos + 10])[0]
+                        else:
+                            height = _struct.unpack(f"{endian}I", payload[pos + 8:pos + 12])[0]
+                    pos += 12
+                if width > 0 and height > 0 and width * height > _MAX_IMAGE_PIXELS:
+                    return _rejected(
+                        version_id, detected_mime,
+                        error_class="unsafe_content",
+                        error_code="IMAGE_PIXEL_LIMIT",
+                        message="The image exceeds the maximum pixel budget.",
+                    )
+                # Next IFD offset
+                next_ifd_pos = ifd_offset + 2 + entry_count * 12
+                if next_ifd_pos + 4 > len(payload):
+                    break
+                ifd_offset = _struct.unpack(f"{endian}I", payload[next_ifd_pos:next_ifd_pos + 4])[0]
     except Exception:
         pass
     return None

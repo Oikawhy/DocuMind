@@ -196,21 +196,14 @@ class OCRService:
         try:
             rapidocr = await self._rapidocr_parser.parse(payload)
         except ParserUnavailableError:
-            # T4-7: Both parsers are operationally unavailable — let Temporal retry.
+            # G-10: Always re-raise when RapidOCR is unavailable so the stage
+            # store's retry policy can kick in.  The previous code only re-raised
+            # when Docling was also unavailable; when Docling ran but produced
+            # low-confidence content (docling_unavailable=False), the returned
+            # unsuccessful ParseResult was treated as a terminal failure by the
+            # stage store, skipping the configured 2 parser retry attempts.
             attempts.append(ParserAttempt(engine="rapidocr", version="unknown", outcome="unavailable"))
-            if docling_unavailable:
-                raise
-            return ParseResult(
-                version_id=str(version_id),
-                success=False,
-                engine=None,
-                text="",
-                pages=[],
-                confidence=0.0,
-                parser_attempts=attempts,
-                safe_error_class="transient_dependency",
-                safe_error_code="PARSER_UNAVAILABLE",
-            )
+            raise
         except Exception:
             attempts.append(ParserAttempt(engine="rapidocr", version="unknown", outcome="failed"))
             return ParseResult(

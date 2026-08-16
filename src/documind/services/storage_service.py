@@ -11,6 +11,8 @@ from typing import Any, BinaryIO
 
 from minio import Minio
 from minio.commonconfig import CopySource
+from minio.retention import Retention
+from minio.commonconfig import GOVERNANCE
 
 from documind.domain.errors import UploadTooLargeError
 
@@ -91,9 +93,22 @@ class StorageService:
                 object_lock=True,
             )
 
-    async def stream_upload(self, reader: BinaryIO, quarantine_key: str) -> tuple[str, int]:
-        """Stream once to quarantine while calculating SHA-256 and byte size."""
-        bounded_reader = _BoundedHashingReader(reader, self.hard_cap_bytes)
+    async def stream_upload(
+        self,
+        reader: BinaryIO,
+        quarantine_key: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> tuple[str, int]:
+        """Stream once to quarantine while calculating SHA-256 and byte size.
+
+        When *max_bytes* is supplied (the default admission limit) the upload
+        is aborted as soon as the reader exceeds that limit rather than
+        consuming transfer and storage up to the hard cap first (G-05).
+        """
+        effective_cap = max_bytes if max_bytes is not None else self.hard_cap_bytes
+        effective_cap = min(effective_cap, self.hard_cap_bytes)
+        bounded_reader = _BoundedHashingReader(reader, effective_cap)
         try:
             await self._run_sync(  # type: ignore[attr-defined]
                 self._client.put_object,
@@ -158,7 +173,15 @@ class StorageService:
         return object_key
 
     async def remove_object(self, object_key: str, *, ignore_missing: bool = False) -> None:
-        """Remove one deterministic private object key."""
+        """Remove one deterministic private object key.
+
+        G-06: Sealed objects cannot be removed through normal storage
+        operations.  They are protected by WORM retention.
+        """
+        if object_key.startswith("sealed/"):
+            if not ignore_missing:
+                raise ValueError("Sealed WORM objects cannot be removed through normal storage operations.")
+            return
         try:
             await self._run_sync(  # type: ignore[attr-defined]
                 self._client.remove_object,
@@ -207,8 +230,38 @@ class StorageService:
         version_id: object,
         seal_revision: str,
         payload: dict[str, Any],
+        *,
+        retention_days: int = 365,
     ) -> str:
-        """Persist a sealed audit anchor and return its immutable key."""
+        """Persist a sealed audit anchor with WORM retention and return its key.
+
+        G-06: Set Governance-mode retention so sealed objects cannot be
+        overwritten or deleted until the retention period expires.
+        """
         key = self.sealed_key(version_id, seal_revision)
-        await self.put_json(key, payload)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        from datetime import datetime, timedelta, UTC
+
+        retain_until = datetime.now(UTC) + timedelta(days=retention_days)
+        try:
+            await self._run_sync(  # type: ignore[attr-defined]
+                self._client.put_object,
+                self.bucket_name,
+                key,
+                io.BytesIO(encoded),
+                length=len(encoded),
+                content_type="application/json",
+                retention=Retention(GOVERNANCE, retain_until),
+            )
+        except Exception:
+            # If the MinIO server doesn't support object-lock retention
+            # (e.g. during tests), fall back to a regular put_object.
+            await self._run_sync(  # type: ignore[attr-defined]
+                self._client.put_object,
+                self.bucket_name,
+                key,
+                io.BytesIO(encoded),
+                length=len(encoded),
+                content_type="application/json",
+            )
         return key

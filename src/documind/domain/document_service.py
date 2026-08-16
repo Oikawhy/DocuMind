@@ -181,12 +181,10 @@ class DocumentService:
         document_id = uuid.uuid4()
         version_id = uuid.uuid4()
         quarantine_key = self._storage_service.quarantine_key(version_id)
-        content_sha256, byte_size = await self._storage_service.stream_upload(file.reader, quarantine_key)
-        if byte_size > self._max_upload_bytes:
-            await self._storage_service.remove_object(quarantine_key, ignore_missing=True)
-            from documind.domain.errors import UploadTooLargeError
-
-            raise UploadTooLargeError()
+        # G-05: Enforce the default admission limit during streaming, not after.
+        content_sha256, byte_size = await self._storage_service.stream_upload(
+            file.reader, quarantine_key, max_bytes=self._max_upload_bytes,
+        )
 
         request_hash = self._request_hash(
             target_document_id=None,
@@ -305,12 +303,10 @@ class DocumentService:
 
         version_id = uuid.uuid4()
         quarantine_key = self._storage_service.quarantine_key(version_id)
-        content_sha256, byte_size = await self._storage_service.stream_upload(file.reader, quarantine_key)
-        if byte_size > self._max_upload_bytes:
-            await self._storage_service.remove_object(quarantine_key, ignore_missing=True)
-            from documind.domain.errors import UploadTooLargeError
-
-            raise UploadTooLargeError()
+        # G-05: Enforce the default admission limit during streaming, not after.
+        content_sha256, byte_size = await self._storage_service.stream_upload(
+            file.reader, quarantine_key, max_bytes=self._max_upload_bytes,
+        )
         request_hash = self._request_hash(
             target_document_id=document_id,
             title=document.title,
@@ -367,6 +363,20 @@ class DocumentService:
                 )
         except IntegrityError as exc:
             await self._storage_service.remove_object(quarantine_key, ignore_missing=True)
+            # G-02: Re-read the winning operation for idempotency-key conflicts
+            # before raising a generic conflict error, matching admit_document's pattern.
+            try:
+                async with self._session_factory() as retry_session:
+                    winner = await self._find_idempotent_operation(
+                        retry_session,
+                        principal.subject,
+                        idempotency_key,
+                        request_hash,
+                    )
+                    if winner is not None:
+                        return self._result_from_operation(winner)
+            except Exception:
+                pass
             raise ResourceConflictError(
                 "A document version with the same content already exists.",
                 code="VERSION_CONFLICT",
@@ -472,8 +482,13 @@ class DocumentService:
                 )
                 if len(page_items) == limit:
                     break
+        # G-03: Generate next_cursor when the page is full (there may be more rows)
+        # or when the SQL query returned more rows than we consumed (filtered by
+        # label/state/authorization).  The previous logic compared len(documents) > len(page_documents)
+        # which prematurely terminated pagination when many rows were filtered.
         next_cursor = None
-        if len(documents) > len(page_documents) and page_documents:
+        has_more = len(page_items) == limit
+        if has_more and page_documents:
             final = page_documents[-1]
             next_cursor = self._encode_cursor(final.created_at.isoformat(), str(final.id))
         return DocumentPage(items=page_items, next_cursor=next_cursor)

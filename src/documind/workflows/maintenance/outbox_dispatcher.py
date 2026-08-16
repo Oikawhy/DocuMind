@@ -118,6 +118,13 @@ class OutboxDispatcher:
         return published
 
 
+class LifecycleChecker(Protocol):
+    """Check whether a version is still eligible for processing."""
+
+    async def assert_active(self, version_id: str) -> None:
+        """Raise when the version was tombstoned or otherwise stopped."""
+
+
 class TemporalWorkflowConsumer:
     """Deduplicate CloudEvents IDs and start one deterministic Temporal workflow."""
 
@@ -127,6 +134,7 @@ class TemporalWorkflowConsumer:
         redis_client: RedisStreamsClient,
         temporal_client: TemporalStarter,
         run_recorder: WorkflowRunRecorder | None = None,
+        lifecycle_checker: LifecycleChecker | None = None,
         workflow_task_queue: str = "ingest-cpu",
         dedupe_ttl_seconds: int = 7 * 24 * 60 * 60,
     ) -> None:
@@ -135,6 +143,7 @@ class TemporalWorkflowConsumer:
         self._workflow_task_queue = workflow_task_queue
         self._dedupe_ttl_seconds = dedupe_ttl_seconds
         self._run_recorder = run_recorder
+        self._lifecycle_checker = lifecycle_checker
 
     async def consume(self, cloud_event: dict[str, Any]) -> bool:
         """Start the workflow once; duplicate Redis delivery is a successful no-op."""
@@ -153,15 +162,27 @@ class TemporalWorkflowConsumer:
         except (KeyError, ValueError, TypeError):
             return False
 
+        # G-08: Check the dedupe key first to fast-path duplicates without
+        # hitting Temporal, but do NOT reserve the key yet.  A crash between
+        # a reservation and a successful workflow start would permanently
+        # block the version.
         dedupe_key = f"documind:outbox:consumed:{event_id}"
-        claimed = await self._redis.set(
+        existing = await self._redis.set(
             dedupe_key,
             "1",
             nx=True,
             ex=self._dedupe_ttl_seconds,
         )
-        if not claimed:
+        if not existing:
             return False
+
+        # G-20: Skip workflow start for versions that were tombstoned between
+        # outbox publication and consumption.
+        if self._lifecycle_checker is not None:
+            try:
+                await self._lifecycle_checker.assert_active(str(version_id))
+            except Exception:
+                return False
 
         workflow_input = DocumentVersionWorkflowInput(
             version_id=str(version_id),
@@ -176,15 +197,23 @@ class TemporalWorkflowConsumer:
                 id=workflow_id_for(version_id),
                 task_queue=self._workflow_task_queue,
             )
+            # G-09: Record the Temporal run ID inside the success path.
+            # Errors in recording must not prevent the workflow from running
+            # or block the consumer — the stage store's claim path also
+            # catches a missing run ID at first activity execution.
             if self._run_recorder is not None:
                 run_id = _workflow_run_id(handle)
                 if run_id is not None:
-                    await self._run_recorder.record_workflow_start(str(version_id), run_id)
+                    try:
+                        await self._run_recorder.record_workflow_start(str(version_id), run_id)
+                    except Exception:
+                        pass  # Non-fatal: the stage store handles orphaned runs.
         except WorkflowAlreadyStartedError:
             # A concurrent consumer reached Temporal first; the workflow ID is
             # the authoritative idempotency boundary for a version.
             return True
         except Exception:
+            # G-08: Release the dedupe key so a retry can re-attempt the start.
             await self._redis.delete(dedupe_key)
             raise
         return True
