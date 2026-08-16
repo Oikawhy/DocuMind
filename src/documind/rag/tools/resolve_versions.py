@@ -86,8 +86,8 @@ async def resolve_versions(
 
         # Check for deletion tombstone.
         tombstone_stmt = select(DeletionTombstone).where(
-            DeletionTombstone.record_type == "document",
-            DeletionTombstone.record_id == doc_uuid,
+            DeletionTombstone.document_id == doc_uuid,
+            DeletionTombstone.scope == "document",
         )
         tombstone_result = await session.execute(tombstone_stmt)
         if tombstone_result.scalar_one_or_none() is not None:

@@ -102,8 +102,8 @@ async def permission_guard(
 
         # Check for deletion tombstone on the document.
         tombstone_stmt = select(DeletionTombstone).where(
-            DeletionTombstone.record_type == "document",
-            DeletionTombstone.record_id == version.document_id,
+            DeletionTombstone.document_id == version.document_id,
+            DeletionTombstone.scope == "document",
         )
         tombstone_result = await session.execute(tombstone_stmt)
         if tombstone_result.scalar_one_or_none() is not None:
