@@ -166,11 +166,12 @@ class DocumentService:
         Bytes are streamed to a deterministic quarantine object before the
         metadata transaction. If that transaction does not commit, those
         bytes are removed.
+
+        T5.1-01: Policy resolution (declared type, chunk profile, template)
+        now happens inside the admission transaction so the pinned selections
+        are consistent with the committed metadata.
         """
         self._validate_admission_request(file=file, title=title, idempotency_key=idempotency_key)
-        declared = await self._get_active_declared_type(declared_type)
-        profile = await self._resolve_chunk_profile(declared, chunk_profile_id)
-        template_revision_id = await self._resolve_template_revision(declared)
         allowed_labels, assignment_policy_id = await self._allowed_labels_and_policy(principal)
         validated_labels = await self._label_service.validate_labels(labels, allowed_labels)
         await self._require_authorized(
@@ -186,17 +187,23 @@ class DocumentService:
             file.reader, quarantine_key, max_bytes=self._max_upload_bytes,
         )
 
-        request_hash = self._request_hash(
-            target_document_id=None,
-            title=title,
-            label_ids=[label.id for label in validated_labels],
-            declared_type=declared.stable_key,
-            profile_id=profile.id,
-            content_sha256=content_sha256,
-            byte_size=byte_size,
-        )
         try:
             async with self._session_factory() as session, session.begin():
+                # T5.1-01: Resolve policy inside the transaction so pinned
+                # selections are consistent with committed metadata.
+                declared = await self._get_active_declared_type(declared_type, session=session)
+                profile = await self._resolve_chunk_profile(declared, chunk_profile_id, session=session)
+                template_revision_id = await self._resolve_template_revision(declared, session=session)
+
+                request_hash = self._request_hash(
+                    target_document_id=None,
+                    title=title,
+                    label_ids=[label.id for label in validated_labels],
+                    declared_type=declared.stable_key,
+                    profile_id=profile.id,
+                    content_sha256=content_sha256,
+                    byte_size=byte_size,
+                )
                 replay = await self._find_idempotent_operation(
                     session,
                     principal.subject,
@@ -261,7 +268,12 @@ class DocumentService:
         principal: Principal,
         idempotency_key: str,
     ) -> AdmissionResult:
-        """Add an immutable version while inheriting document labels and policy."""
+        """Add an immutable version while inheriting document labels and policy.
+
+        T5.1-02: Resolve chunk profile and template from the declared-type
+        policy instead of copying from the latest version. This ensures
+        new versions pick up policy updates.
+        """
         self._validate_admission_request(file=file, title="version", idempotency_key=idempotency_key)
         async with self._session_factory() as session:
             document = await session.get(Document, document_id)
@@ -293,8 +305,13 @@ class DocumentService:
             ).scalar_one_or_none()
             if latest is None:
                 raise ResourceConflictError("The document has no immutable version.")
-            profile_id = latest.selected_chunk_profile_revision_id
-            template_revision_id = latest.selected_template_revision_id
+            # T5.1-02: Resolve from declared-type policy rather than copying
+            # from the latest version, so new versions pick up policy updates.
+            declared = await self._get_active_declared_type_by_id(
+                document.declared_type_id, session=session,
+            )
+            profile = await self._resolve_chunk_profile(declared, None, session=session)
+            template_revision_id = await self._resolve_template_revision(declared, session=session)
         await self._require_authorized(
             principal,
             "version_create",
@@ -307,6 +324,7 @@ class DocumentService:
         content_sha256, byte_size = await self._storage_service.stream_upload(
             file.reader, quarantine_key, max_bytes=self._max_upload_bytes,
         )
+        profile_id = profile.id
         request_hash = self._request_hash(
             target_document_id=document_id,
             title=document.title,
@@ -756,6 +774,7 @@ class DocumentService:
             content_sha256,
             byte_size,
             template_revision_id,
+            profile_id=profile_id,
         )
         return result
 
@@ -768,7 +787,9 @@ class DocumentService:
         content_sha256: str,
         byte_size: int,
         template_revision_id: uuid.UUID | None = None,
+        profile_id: uuid.UUID | None = None,
     ) -> None:
+        # T5.1-03: Include chunk profile revision in the audit trail.
         entry = AuditEntry(
             actor_subject=principal.subject,
             action="document_version.accepted",
@@ -779,6 +800,7 @@ class DocumentService:
                 "content_sha256": content_sha256,
                 "byte_size": byte_size,
                 "template_revision_id": str(template_revision_id) if template_revision_id else None,
+                "chunk_profile_revision_id": str(profile_id) if profile_id else None,
             },
         )
         await self._audit_service.write_event_in_session(session, entry)
@@ -803,16 +825,56 @@ class DocumentService:
             raise InvalidRequestError("No active admission policy is available.", code="AUTHORIZATION_UNAVAILABLE")
         return allowed, policy.id
 
-    async def _get_active_declared_type(self, stable_key: str) -> DeclaredType:
-        async with self._session_factory() as session:
-            declared = (
-                await session.execute(
+    async def _get_active_declared_type(
+        self, stable_key: str, *, session: AsyncSession | None = None,
+    ) -> DeclaredType:
+        """Load the active declared type by stable key.
+
+        T5.1-01: Accepts an optional *session* so callers can resolve the
+        declared type inside an existing transaction boundary.
+        """
+        async def _query(s: AsyncSession) -> DeclaredType | None:
+            return (
+                await s.execute(
                     select(DeclaredType).where(
                         DeclaredType.stable_key == stable_key,
                         DeclaredType.active.is_(True),
                     ),
                 )
             ).scalar_one_or_none()
+
+        if session is not None:
+            declared = await _query(session)
+        else:
+            async with self._session_factory() as new_session:
+                declared = await _query(new_session)
+        if declared is None:
+            raise InvalidRequestError("The declared type is not active.", code="DECLARED_TYPE_INVALID")
+        return declared
+
+    async def _get_active_declared_type_by_id(
+        self, declared_type_id: uuid.UUID, *, session: AsyncSession | None = None,
+    ) -> DeclaredType:
+        """Load the active declared type by primary key.
+
+        T5.1-02: Used by admit_version to resolve from the document's
+        declared_type_id rather than a stable key.
+        """
+        async def _query(s: AsyncSession) -> DeclaredType | None:
+            return (
+                await s.execute(
+                    select(DeclaredType).where(
+                        DeclaredType.id == declared_type_id,
+                        DeclaredType.active.is_(True),
+                    ),
+                )
+            ).scalar_one_or_none()
+
+        if session is not None:
+            declared = await _query(session)
+        else:
+            async with self._session_factory() as new_session:
+                declared = await _query(new_session)
         if declared is None:
             raise InvalidRequestError("The declared type is not active.", code="DECLARED_TYPE_INVALID")
         return declared
@@ -821,52 +883,69 @@ class DocumentService:
         self,
         declared_type: DeclaredType,
         selected_profile_id: uuid.UUID | None,
+        *,
+        session: AsyncSession | None = None,
     ) -> ChunkProfileRevision:
-        async with self._session_factory() as session:
+        """Resolve the chunk profile revision for an admission.
+
+        T5.1-01: Accepts an optional *session* so profile resolution happens
+        inside the admission transaction.
+        """
+        async def _query(s: AsyncSession) -> ChunkProfileRevision:
             if selected_profile_id is not None:
-                profile = await session.get(ChunkProfileRevision, selected_profile_id)
+                profile = await s.get(ChunkProfileRevision, selected_profile_id)
                 if profile is not None and profile.status == PolicyStatus.ACTIVE:
                     return profile
                 raise ChunkProfileValidationError()
-            policy = await session.get(PolicyRevision, declared_type.active_policy_revision_id)
+            policy = await s.get(PolicyRevision, declared_type.active_policy_revision_id)
             configured_id = policy.body.get("chunk_profile_revision_id") if policy else None
             if configured_id:
                 try:
-                    profile = await session.get(ChunkProfileRevision, uuid.UUID(str(configured_id)))
+                    profile = await s.get(ChunkProfileRevision, uuid.UUID(str(configured_id)))
                 except ValueError:
                     profile = None
                 if profile is not None and profile.status == PolicyStatus.ACTIVE:
                     return profile
             profiles = list(
                 (
-                    await session.execute(
+                    await s.execute(
                         select(ChunkProfileRevision).where(ChunkProfileRevision.status == PolicyStatus.ACTIVE),
                     )
                 )
                 .scalars()
                 .all()
             )
-        if len(profiles) == 1:
-            return profiles[0]
-        raise ChunkProfileValidationError()
+            if len(profiles) == 1:
+                return profiles[0]
+            raise ChunkProfileValidationError()
+
+        if session is not None:
+            return await _query(session)
+        async with self._session_factory() as new_session:
+            return await _query(new_session)
 
     async def _resolve_template_revision(
         self,
         declared_type: DeclaredType,
+        *,
+        session: AsyncSession | None = None,
     ) -> uuid.UUID | None:
         """Resolve the extraction template revision from the declared-type policy.
 
         Returns ``None`` when the policy intentionally has no template mapping.
         Raises ``TemplateResolutionError`` when a configured revision exists but
         is inactive, missing, or belongs to a different declared type.
+
+        T5.1-01: Accepts an optional *session* so template resolution happens
+        inside the admission transaction.
         """
-        async with self._session_factory() as session:
-            policy = await session.get(PolicyRevision, declared_type.active_policy_revision_id)
+        async def _query(s: AsyncSession) -> uuid.UUID | None:
+            policy = await s.get(PolicyRevision, declared_type.active_policy_revision_id)
             configured_id = policy.body.get("extraction_template_revision_id") if policy else None
             if not configured_id:
                 return None
             try:
-                template = await session.get(ExtractionTemplateRevision, uuid.UUID(str(configured_id)))
+                template = await s.get(ExtractionTemplateRevision, uuid.UUID(str(configured_id)))
             except ValueError:
                 raise TemplateResolutionError(
                     "The policy references an invalid extraction template revision identifier."
@@ -880,6 +959,11 @@ class DocumentService:
                     "The configured extraction template belongs to a different declared type."
                 )
             return template.id
+
+        if session is not None:
+            return await _query(session)
+        async with self._session_factory() as new_session:
+            return await _query(new_session)
 
     async def _find_idempotent_operation(
         self,
