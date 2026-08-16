@@ -240,7 +240,7 @@ async def test_write_order_source_entity_fact_relationships() -> None:
     version_merge = next(i for i, q in enumerate(queries) if "MERGE (v:DocumentVersion" in q)
     entity_merge = next(i for i, q in enumerate(queries) if "MERGE (e:Entity" in q)
     fact_merge = next(i for i, q in enumerate(queries) if "MERGE (f:Fact" in q)
-    subject_of = next(i for i, q in enumerate(queries) if "SUBJECT_OF" in q)
+    subject_of = next(i for i, q in enumerate(queries) if "ABOUT" in q)
 
     # Source before entities before facts before relationships
     assert chunk_merge < entity_merge, "Source (Chunk) must come before Entity"
@@ -358,19 +358,19 @@ async def test_literal_object_remains_fact_property() -> None:
     assert params["object_literal"] is not None
     assert "currency" in params["object_literal"]
 
-    # No OBJECT_ENTITY relationship should exist for literal objects
-    obj_rel_stmts = [q for q, _ in tx.statements if "OBJECT_ENTITY" in q]
+    # No MENTIONS relationship should exist for literal objects
+    obj_rel_stmts = [q for q, _ in tx.statements if "MENTIONS" in q]
     assert len(obj_rel_stmts) == 0
 
 
 # ---------------------------------------------------------------------------
-# Tests: SUPPORTED_BY relationship
+# Tests: SOURCED_FROM relationship
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_every_fact_has_supported_by_chunk() -> None:
-    """Every Fact connects through (:Fact)-[:SUPPORTED_BY]->(:Chunk)."""
+async def test_every_fact_has_sourced_from_chunk() -> None:
+    """Every Fact connects through (:Fact)-[:SOURCED_FROM]->(:Chunk)."""
     driver = FakeDriver()
     payloads = [_make_payload(fact_id=f"fact-{i}") for i in range(3)]
     resolver = FakeGraphPayloadResolver(payloads)
@@ -383,8 +383,8 @@ async def test_every_fact_has_supported_by_chunk() -> None:
     await writer.project(snapshot)
 
     tx = driver.sessions[0].transactions[0]
-    supported_by = [(q, p) for q, p in tx.statements if "SUPPORTED_BY" in q]
-    assert len(supported_by) == 3  # One per fact
+    sourced_from = [(q, p) for q, p in tx.statements if "SOURCED_FROM" in q]
+    assert len(sourced_from) == 3  # One per fact
 
 
 # ---------------------------------------------------------------------------

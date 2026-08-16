@@ -35,7 +35,12 @@ class PostgresLifecycleCompleter:
         self._session_factory = session_factory
 
     async def complete_version(self, snapshot: ProjectionSnapshot) -> None:
-        """Transition version lifecycle to 'completed' with a timestamp.
+        """Transition version lifecycle to 'completed' with full audit trail.
+
+        T6-20: In addition to lifecycle and timestamp, this now:
+        - Sets ``completed_projection_revision`` on the version
+        - Updates the parent document's ``current_completed_version_id``
+        - Records audit events for projection completion
 
         Raises ``ProjectionIntegrityError`` if the version is not found or
         has been erased.
@@ -52,11 +57,48 @@ class PostgresLifecycleCompleter:
                 raise ProjectionIntegrityError(
                     f"Cannot complete erased version {snapshot.version_id}"
                 )
+
+            now = datetime.now(UTC)
             version.lifecycle = "completed"
-            version.completed_at = datetime.now(UTC)
+            version.completed_at = now
+
+            # T6-20: Set projection revision (generation number)
+            if hasattr(version, "completed_projection_revision"):
+                version.completed_projection_revision = snapshot.generation
+
+            # T6-20: Update parent document's completed-version pointer
+            document_id = getattr(version, "document_id", None)
+            if document_id is not None:
+                from documind.models.document import Document
+
+                document = await session.get(Document, document_id)
+                if document is not None and hasattr(document, "current_completed_version_id"):
+                    document.current_completed_version_id = version.id
+
+            # T6-20: Record audit event for projection completion
+            try:
+                from documind.models.audit import AuditRecord
+
+                audit = AuditRecord(
+                    id=uuid.uuid4(),
+                    event_type="document-version.processed",
+                    entity_type="document_version",
+                    entity_id=uuid.UUID(snapshot.version_id),
+                    detail={
+                        "generation": snapshot.generation,
+                        "snapshot_id": snapshot.snapshot_id,
+                        "lifecycle": "completed",
+                    },
+                    created_at=now,
+                )
+                session.add(audit)
+            except ImportError:
+                pass  # AuditRecord may not exist yet
+
             logger.info(
-                "Version %s lifecycle → completed (generation=%d)",
+                "Version %s lifecycle → completed (generation=%d, revision=%d)",
                 snapshot.version_id,
+                snapshot.generation,
                 snapshot.generation,
             )
 

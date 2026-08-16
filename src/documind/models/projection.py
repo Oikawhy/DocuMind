@@ -42,7 +42,7 @@ class ProjectionState(Base):
             name="valid_projection_type",
         ),
         CheckConstraint(
-            "state IN ('pending', 'writing', 'verified', 'unhealthy', 'erased')",
+            "state IN ('pending', 'writing', 'projected', 'verified', 'unhealthy', 'erased')",
             name="valid_projection_state",
         ),
         CheckConstraint(

@@ -64,9 +64,12 @@ class WorkerConfiguration:
 class IngestionWorkerRuntime:
     """Fully configured worker roles sharing durable PostgreSQL stage state.
 
-    Runs two Temporal workers:
+    Runs Temporal workers for each queue:
     - ``ingest-cpu``: inspect, parse, normalize, chunk activities + workflow registration
-    - ``model-gpu``: enrich activity only (no workflow registration, no ingest dependencies)
+    - ``model-gpu``: enrich activity only
+    - ``project-gpu``: projection write (embedding + upsert)
+    - ``project-cpu``: verification + completion
+    - ``rebuild-cpu``: rebuild workflow + activities
     """
 
     ingest_worker: Worker
@@ -75,14 +78,28 @@ class IngestionWorkerRuntime:
     dispatcher: OutboxDispatcher
     redis_client: Any
     engine: AsyncEngine
+    project_gpu_worker: Worker | None = None
+    project_cpu_worker: Worker | None = None
+    rebuild_worker: Worker | None = None
 
     async def run(self, shutdown: asyncio.Event) -> None:
-        """Run both workers, the outbox dispatcher, and the Redis consumer together until shutdown."""
+        """Run all workers, the outbox dispatcher, and the Redis consumer together until shutdown."""
         dispatch_task = asyncio.create_task(
             self._dispatch_loop(shutdown), name="outbox-dispatcher"
         )
+        # Collect all worker context managers
+        workers = [self.ingest_worker, self.model_worker]
+        if self.project_gpu_worker is not None:
+            workers.append(self.project_gpu_worker)
+        if self.project_cpu_worker is not None:
+            workers.append(self.project_cpu_worker)
+        if self.rebuild_worker is not None:
+            workers.append(self.rebuild_worker)
+
         try:
-            async with self.ingest_worker, self.model_worker:
+            async with contextlib.AsyncExitStack() as stack:
+                for worker in workers:
+                    await stack.enter_async_context(worker)
                 await self.stream_runner.run(shutdown)
         finally:
             dispatch_task.cancel()
@@ -253,20 +270,65 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
     )
     stream_runner = RedisStreamWorkflowRunner(redis_client=redis_client, consumer=consumer)
 
-    # ingest-cpu worker: runs the workflow + inspect/parse/normalize/chunk + projection activities
+    # T6-21/T6-25: Register rebuild workflow and projection workers
+    from documind.services.generation_manager import ActiveGenerationManager
+    from documind.workflows.document_version import (
+        PROJECT_CPU_QUEUE,
+        PROJECT_GPU_QUEUE,
+        REBUILD_QUEUE,
+    )
+    from documind.workflows.maintenance.rebuild_projections import (
+        RebuildProjectionWorkflow,
+        activate_generation,
+        configure_rebuild_activities,
+        rebuild_projection,
+        verify_rebuild,
+    )
+
+    generation_manager = ActiveGenerationManager(session_factory=session_factory)
+    configure_rebuild_activities(
+        coordinator,
+        generation_manager=generation_manager,
+    )
+
+    # ingest-cpu worker: runs the workflow + inspect/parse/normalize/chunk
     ingest_worker = Worker(
         temporal_client,
         task_queue=INGEST_QUEUE,
         workflows=[DocumentVersionWorkflow],
-        activities=[inspect, parse, normalize, chunk, project, verify, complete],
+        activities=[inspect, parse, normalize, chunk],
     )
 
-    # model-gpu worker: runs ONLY the enrich activity; no workflows, no ingest dependencies
+    # model-gpu worker: runs ONLY the enrich activity
     model_worker = Worker(
         temporal_client,
         task_queue=MODEL_QUEUE,
         workflows=[],
         activities=[enrich],
+    )
+
+    # T6-25: project-gpu worker: runs embedding + projection write
+    project_gpu_worker = Worker(
+        temporal_client,
+        task_queue=PROJECT_GPU_QUEUE,
+        workflows=[],
+        activities=[project],
+    )
+
+    # T6-25: project-cpu worker: runs verification + completion
+    project_cpu_worker = Worker(
+        temporal_client,
+        task_queue=PROJECT_CPU_QUEUE,
+        workflows=[],
+        activities=[verify, complete],
+    )
+
+    # T6-21: rebuild-cpu worker: runs rebuild workflow + activities
+    rebuild_worker = Worker(
+        temporal_client,
+        task_queue=REBUILD_QUEUE,
+        workflows=[RebuildProjectionWorkflow],
+        activities=[rebuild_projection, verify_rebuild, activate_generation],
     )
 
     # T4-1: Construct the outbox dispatcher to publish pending rows to Redis.
@@ -282,6 +344,9 @@ async def _build_ingestion_runtime(temporal_client: Client, settings: Settings) 
         dispatcher=dispatcher,
         redis_client=redis_client,
         engine=engine,
+        project_gpu_worker=project_gpu_worker,
+        project_cpu_worker=project_cpu_worker,
+        rebuild_worker=rebuild_worker,
     )
 
 
@@ -423,14 +488,13 @@ def _build_projection_coordinator(
 ) -> Any:
     """Build a ProjectionCoordinator with real PostgreSQL-backed adapters.
 
-    Replaces the former stub implementations with durable evidence,
-    lifecycle completion, generation-aware tombstone checking, and
-    canonical snapshot resolution.  External projection clients (Qdrant,
-    OpenSearch, Neo4j) are not constructed here — they are injected
-    separately during full integration when the respective drivers are
-    available.  This provides protocol-compatible durable adapters for
-    the worker bootstrap.
+    Constructs durable evidence, lifecycle completion, generation-aware
+    tombstone checking, canonical snapshot resolution, production payload
+    resolvers, and projection writers.  External clients fall back to
+    pass-through writers when their drivers are not installed.
     """
+    from documind.services.chunk_payload_resolver import PostgresChunkPayloadResolver
+    from documind.services.graph_fact_payload_resolver import PostgresGraphFactPayloadResolver
     from documind.services.lifecycle_completer import (
         GenerationAwareTombstoneGuard,
         PostgresLifecycleCompleter,
@@ -448,13 +512,27 @@ def _build_projection_coordinator(
     tombstone_guard = GenerationAwareTombstoneGuard(session_factory=session_factory)
     lifecycle_completer = PostgresLifecycleCompleter(session_factory=session_factory)
 
+    # Production payload resolvers
+    # T6-01: Build EmbeddingService when model path is configured
+    embedder = _build_embedder(settings)
+    chunk_resolver = PostgresChunkPayloadResolver(
+        session_factory=session_factory,
+        embedder=embedder,
+    )
+    graph_fact_resolver = PostgresGraphFactPayloadResolver(
+        session_factory=session_factory,
+    )
+
     # Projection writers — use real implementations when external drivers
-    # are available (configured via settings); fall back to pass-through
-    # writers that satisfy the protocol for environments without the
-    # external services running.
+    # are available; fall back to pass-through writers that satisfy the
+    # protocol for environments without the external services running.
     writers: dict[ProjectionBackend, Any] = {}
     for backend in ProjectionBackend:
-        writers[backend] = _build_projection_writer(backend, session_factory, settings)
+        writers[backend] = _build_projection_writer(
+            backend, session_factory, settings,
+            chunk_resolver=chunk_resolver,
+            graph_fact_resolver=graph_fact_resolver,
+        )
 
     return ProjectionCoordinator(
         source=source,
@@ -466,10 +544,42 @@ def _build_projection_coordinator(
     )
 
 
+def _build_embedder(settings: Any) -> Any:
+    """Build BGE-M3 EmbeddingService if model path is configured.
+
+    Returns None when the model path is not set or the embedding
+    service cannot be constructed (e.g. missing dependencies).
+    """
+    model_path = getattr(settings, "embedding_model_path", None)
+    if not model_path:
+        logger.info("No embedding_model_path configured; embeddings will not be attached to projections")
+        return None
+    try:
+        from documind.services.embedding_service import EmbeddingService
+
+        model_digest = getattr(settings, "embedding_model_digest", None)
+        service = EmbeddingService(
+            model_path=model_path,
+            expected_digest=model_digest,
+        )
+        logger.info("EmbeddingService configured: path=%s", model_path)
+        return service
+    except Exception:
+        logger.warning(
+            "Failed to construct EmbeddingService from %s; projections will lack embeddings",
+            model_path,
+            exc_info=True,
+        )
+        return None
+
+
 def _build_projection_writer(
     backend: Any,
     session_factory: async_sessionmaker[AsyncSession],
     settings: Any,
+    *,
+    chunk_resolver: Any = None,
+    graph_fact_resolver: Any = None,
 ) -> Any:
     """Build a single projection writer for the given backend.
 
@@ -491,13 +601,19 @@ def _build_projection_writer(
             from documind.services.indexing_service import QdrantProjectionWriter
 
             client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
-            return QdrantProjectionWriter(
+            writer = QdrantProjectionWriter(
                 client=client,
                 collection=settings.qdrant_collection,
-                dimension=1024,
+                embedding_dimension=1024,
+                payload_resolver=chunk_resolver,
             )
+            logger.info("Qdrant projection writer constructed (collection=%s)", settings.qdrant_collection)
+            return writer
         except ImportError:
-            pass
+            logger.warning(
+                "qdrant-client not installed; using passthrough writer for Qdrant. "
+                "Set DOCUMIND_REQUIRE_PROJECTION_BACKENDS=true to fail on missing backends."
+            )
 
     elif backend == ProjectionBackend.OPENSEARCH:
         try:
@@ -508,9 +624,18 @@ def _build_projection_writer(
             client = AsyncOpenSearch(
                 hosts=[{"host": settings.opensearch_host, "port": settings.opensearch_port}],
             )
-            return OpenSearchProjectionWriter(client=client, index_name=settings.opensearch_index)
+            writer = OpenSearchProjectionWriter(
+                client=client,
+                index_name=settings.opensearch_index,
+                payload_resolver=chunk_resolver,
+            )
+            logger.info("OpenSearch projection writer constructed (index=%s)", settings.opensearch_index)
+            return writer
         except ImportError:
-            pass
+            logger.warning(
+                "opensearch-py not installed; using passthrough writer for OpenSearch. "
+                "Set DOCUMIND_REQUIRE_PROJECTION_BACKENDS=true to fail on missing backends."
+            )
 
     elif backend == ProjectionBackend.NEO4J:
         try:
@@ -521,9 +646,25 @@ def _build_projection_writer(
             neo4j_auth = os.environ.get("DOCUMIND_RESOLVED_NEO4J_AUTH", "")
             auth_tuple = tuple(neo4j_auth.split(":", 1)) if ":" in neo4j_auth else ("neo4j", "password")
             driver = AsyncGraphDatabase.driver(settings.neo4j_uri, auth=auth_tuple)
-            return Neo4jProjectionWriter(driver=driver)
+            writer = Neo4jProjectionWriter(
+                driver=driver,
+                payload_resolver=graph_fact_resolver,
+            )
+            logger.info("Neo4j projection writer constructed (uri=%s)", settings.neo4j_uri)
+            return writer
         except ImportError:
-            pass
+            logger.warning(
+                "neo4j driver not installed; using passthrough writer for Neo4j. "
+                "Set DOCUMIND_REQUIRE_PROJECTION_BACKENDS=true to fail on missing backends."
+            )
+
+    # Check if the user requires all backends (T6-02)
+    require_backends = getattr(settings, "require_projection_backends", False)
+    if require_backends:
+        raise RuntimeError(
+            f"Projection backend {backend.value!r} is not available but "
+            f"DOCUMIND_REQUIRE_PROJECTION_BACKENDS is set. Install the required driver."
+        )
 
     # Fallback pass-through writer for environments without external drivers
     class _PassthroughWriter:
@@ -531,13 +672,18 @@ def _build_projection_writer(
             self._backend = backend
 
         async def project(self, snapshot: ProjectionSnapshot) -> ProjectionManifest:
+            # T6-08: Count only records matching this backend's projection type
+            if self._backend == ProjectionBackend.NEO4J:
+                relevant = [r for r in snapshot.records if r.projection_type == "fact"]
+            else:
+                relevant = [r for r in snapshot.records if r.projection_type == "chunk"]
             return ProjectionManifest(
                 backend=self._backend,
                 snapshot_id=snapshot.snapshot_id,
                 generation=snapshot.generation,
                 tombstone_generation=snapshot.tombstone_generation,
-                record_count=len(snapshot.records),
-                checksum=manifest_checksum(snapshot.records),
+                record_count=len(relevant),
+                checksum=manifest_checksum(tuple(relevant)),
             )
 
     return _PassthroughWriter(backend)

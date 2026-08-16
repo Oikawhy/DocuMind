@@ -75,10 +75,28 @@ class PostgresEvidenceStore:
             ) if row.state == "verified" else None,
         )
 
-    async def record_outcome(self, outcome: WriterOutcome) -> None:
-        """Persist or update a writer outcome as a ``projection_state`` row."""
+    async def record_outcome(
+        self, outcome: WriterOutcome, *, snapshot: ProjectionSnapshot | None = None,
+    ) -> None:
+        """Persist or update a writer outcome as a ``projection_state`` row.
+
+        When *snapshot* is provided its version_id is used to compute the
+        scope_key consistently with ``state_for()``.  Without it the method
+        falls back to the outcome's snapshot_id — but callers should always
+        pass the snapshot so lookups and writes agree.
+        """
         async with self._session_factory() as session, session.begin():
-            scope_key = outcome.snapshot_id if outcome.backend != ProjectionBackend.NEO4J else "global"
+            if snapshot is not None:
+                scope_key = _scope_key(outcome.backend, snapshot)
+                version_id_value = (
+                    uuid.UUID(snapshot.version_id)
+                    if snapshot.version_id and outcome.backend != ProjectionBackend.NEO4J
+                    else None
+                )
+            else:
+                scope_key = "global" if outcome.backend == ProjectionBackend.NEO4J else outcome.snapshot_id
+                version_id_value = None
+
             row = (
                 await session.execute(
                     select(ProjectionState).where(
@@ -94,6 +112,7 @@ class PostgresEvidenceStore:
                 row = ProjectionState(
                     id=uuid.uuid4(),
                     projection_kind=outcome.backend.value,
+                    version_id=version_id_value,
                     scope_key=scope_key,
                     generation=outcome.generation,
                     state=outcome.status,
@@ -107,16 +126,30 @@ class PostgresEvidenceStore:
             else:
                 row.state = outcome.status
                 row.state_changed_at = now
+                if version_id_value is not None:
+                    row.version_id = version_id_value
                 if outcome.manifest:
                     row.expected_count = outcome.manifest.record_count
                     row.source_sha256 = outcome.manifest.checksum
                 if outcome.safe_error_class:
                     row.last_error_code = outcome.safe_error_class
 
-    async def record_manifest(self, manifest: ProjectionManifest) -> None:
+    async def record_manifest(
+        self, manifest: ProjectionManifest, *, snapshot: ProjectionSnapshot | None = None,
+    ) -> None:
         """Mark a projection as verified with the observed manifest data."""
         async with self._session_factory() as session, session.begin():
-            scope_key = manifest.snapshot_id if manifest.backend != ProjectionBackend.NEO4J else "global"
+            if snapshot is not None:
+                scope_key = _scope_key(manifest.backend, snapshot)
+                version_id_value = (
+                    uuid.UUID(snapshot.version_id)
+                    if snapshot.version_id and manifest.backend != ProjectionBackend.NEO4J
+                    else None
+                )
+            else:
+                scope_key = "global" if manifest.backend == ProjectionBackend.NEO4J else manifest.snapshot_id
+                version_id_value = None
+
             row = (
                 await session.execute(
                     select(ProjectionState).where(
@@ -132,6 +165,7 @@ class PostgresEvidenceStore:
                 row = ProjectionState(
                     id=uuid.uuid4(),
                     projection_kind=manifest.backend.value,
+                    version_id=version_id_value,
                     scope_key=scope_key,
                     generation=manifest.generation,
                     state="verified",

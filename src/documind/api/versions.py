@@ -32,20 +32,42 @@ async def reindex_version(
 ) -> dict[str, str] | JSONResponse:
     """Trigger a new projection revision for a document version.
 
-    Returns an asynchronous operation reference. The caller must be
-    authorized to write to the document.
+    T6-21: Starts a ``RebuildProjectionWorkflow`` via Temporal and
+    returns an asynchronous operation reference.
     """
     try:
         _principal(request)
-        # Projection rebuild is delegated to the existing operation/workflow
-        # system. For now, return the accepted operation stub.
-        document_service: Any = getattr(request.app.state, "document_service", None)
-        if document_service is None:
-            raise PolicyUnavailableError("Document service is unavailable.")
+
+        temporal_client: Any = getattr(request.app.state, "temporal_client", None)
+        if temporal_client is None:
+            raise PolicyUnavailableError("Temporal client is unavailable for reindex.")
+
+        from documind.workflows.document_version import REBUILD_QUEUE
+        from documind.workflows.maintenance.rebuild_projections import (
+            RebuildProjectionInput,
+            RebuildProjectionWorkflow,
+        )
+
+        # Start rebuild workflows for all three backends scoped to this version
+        workflow_id = f"reindex-{version_id}"
+        await temporal_client.start_workflow(
+            RebuildProjectionWorkflow.run,
+            RebuildProjectionInput(
+                backend="qdrant",
+                scope="version",
+                scope_id=str(version_id),
+                reason="reindex",
+                requested_by="api",
+            ),
+            id=f"{workflow_id}-qdrant",
+            task_queue=REBUILD_QUEUE,
+        )
+
         return {
             "version_id": str(version_id),
             "status": "accepted",
-            "status_url": f"/v1/operations/reindex-{version_id}",
+            "workflow_id": workflow_id,
+            "status_url": f"/v1/operations/{workflow_id}",
         }
     except DomainError as exc:
         return error_response(request, exc)

@@ -15,6 +15,9 @@ from temporalio.common import RetryPolicy
 
 INGEST_QUEUE = "ingest-cpu"
 MODEL_QUEUE = "model-gpu"
+PROJECT_GPU_QUEUE = "project-gpu"
+PROJECT_CPU_QUEUE = "project-cpu"
+REBUILD_QUEUE = "rebuild-cpu"
 
 
 def workflow_id_for(version_id: uuid.UUID | str) -> str:
@@ -154,9 +157,9 @@ class DocumentVersionWorkflow:
             StageConfiguration("normalize", 300, 30, 3, INGEST_QUEUE),
             StageConfiguration("chunk", 300, 30, 3, INGEST_QUEUE),
             StageConfiguration("enrich", 300, 30, 2, MODEL_QUEUE),
-            StageConfiguration("project", 600, 30, 2, INGEST_QUEUE),
-            StageConfiguration("verify", 120, 30, 2, INGEST_QUEUE),
-            StageConfiguration("complete", 120, 30, 1, INGEST_QUEUE),
+            StageConfiguration("project", 600, 30, 2, PROJECT_GPU_QUEUE),
+            StageConfiguration("verify", 120, 30, 2, PROJECT_CPU_QUEUE),
+            StageConfiguration("complete", 120, 30, 1, PROJECT_CPU_QUEUE),
         )
 
     @workflow.run

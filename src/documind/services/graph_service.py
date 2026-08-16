@@ -155,13 +155,15 @@ class Neo4jProjectionWriter:
             except (ConnectionError, OSError, TimeoutError) as exc:
                 raise ProjectionTransientError(f"Neo4j batch {batch_idx} failed: {exc}") from exc
 
+        # T6-08: Count only fact records for this backend's manifest
+        fact_records = tuple(r for r in snapshot.records if r.projection_type == "fact")
         return ProjectionManifest(
             backend=ProjectionBackend.NEO4J,
             snapshot_id=snapshot.snapshot_id,
             generation=snapshot.generation,
             tombstone_generation=snapshot.tombstone_generation,
-            record_count=len(snapshot.records),
-            checksum=manifest_checksum(snapshot.records),
+            record_count=len(fact_records),
+            checksum=manifest_checksum(fact_records),
         )
 
     @staticmethod
@@ -177,7 +179,12 @@ class Neo4jProjectionWriter:
 
     @staticmethod
     def _split_batches(payloads: list[GraphFactPayload]) -> list[list[GraphFactPayload]]:
-        """Split payloads into batches of max 500 facts or 5 MiB serialized."""
+        """Split payloads into batches of max 500 facts or 5 MiB serialized.
+
+        Raises ``ProjectionIntegrityError`` if a single fact exceeds 5 MiB.
+        """
+        from documind.services.projection_service import ProjectionIntegrityError
+
         if not payloads:
             return []
 
@@ -187,6 +194,12 @@ class Neo4jProjectionWriter:
 
         for payload in payloads:
             payload_size = Neo4jProjectionWriter._payload_byte_size(payload)
+            # T6-12: Reject oversized single facts
+            if payload_size > _MAX_BYTES_PER_TX:
+                raise ProjectionIntegrityError(
+                    f"Single fact {payload.fact_id} ({payload_size} bytes) exceeds "
+                    f"the {_MAX_BYTES_PER_TX} byte transaction limit"
+                )
             if (
                 len(current_batch) >= _MAX_FACTS_PER_TX or (current_bytes + payload_size) > _MAX_BYTES_PER_TX
             ) and current_batch:
@@ -225,7 +238,10 @@ class Neo4jProjectionWriter:
                         c.page_end = $page_end,
                         c.section_path = $section_path,
                         c.content_hash = $content_hash,
-                        c.lifecycle = $lifecycle
+                        c.lifecycle = $lifecycle,
+                        c.version_id = $version_id,
+                        c.document_id = $document_id,
+                        c.content_sha256 = $content_hash
                     """,
                     chunk_id=payload.source_chunk_id,
                     page_start=payload.chunk_page_start,
@@ -233,6 +249,8 @@ class Neo4jProjectionWriter:
                     section_path=payload.chunk_section_path or [],
                     content_hash=payload.chunk_content_hash,
                     lifecycle=payload.chunk_lifecycle,
+                    version_id=payload.source_version_id,
+                    document_id=payload.source_document_id,
                 )
 
             if payload.source_version_id and payload.source_version_id not in seen_versions:
@@ -346,12 +364,12 @@ class Neo4jProjectionWriter:
 
         # --- 4. Relationships ---
         for payload in batch:
-            # (:Entity)-[:SUBJECT_OF]->(:Fact)
+            # T6-14: (:Entity)-[:ABOUT]->(:Fact) — matches retrieval queries
             await tx.run(
                 """
                 MATCH (e:Entity {entity_type: $entity_type, normalized_key: $normalized_key})
                 MATCH (f:Fact {fact_id: $fact_id, generation: $generation})
-                MERGE (e)-[:SUBJECT_OF]->(f)
+                MERGE (e)-[:ABOUT]->(f)
                 """,
                 entity_type=payload.subject_entity_type,
                 normalized_key=payload.subject_normalized_key,
@@ -359,13 +377,13 @@ class Neo4jProjectionWriter:
                 generation=generation,
             )
 
-            # (:Fact)-[:OBJECT_ENTITY]->(:Entity) for entity objects
+            # T6-14: (:Fact)-[:MENTIONS]->(:Entity) for entity objects
             if payload.object_entity_type and payload.object_normalized_key:
                 await tx.run(
                     """
                     MATCH (f:Fact {fact_id: $fact_id, generation: $generation})
                     MATCH (e:Entity {entity_type: $entity_type, normalized_key: $normalized_key})
-                    MERGE (f)-[:OBJECT_ENTITY]->(e)
+                    MERGE (f)-[:MENTIONS]->(e)
                     """,
                     fact_id=payload.fact_id,
                     generation=generation,
@@ -373,13 +391,13 @@ class Neo4jProjectionWriter:
                     normalized_key=payload.object_normalized_key,
                 )
 
-            # (:Fact)-[:SUPPORTED_BY]->(:Chunk)
+            # T6-14: (:Fact)-[:SOURCED_FROM]->(:Chunk) — matches retrieval queries
             if payload.source_chunk_id:
                 await tx.run(
                     """
                     MATCH (f:Fact {fact_id: $fact_id, generation: $generation})
                     MATCH (c:Chunk {chunk_id: $chunk_id})
-                    MERGE (f)-[:SUPPORTED_BY]->(c)
+                    MERGE (f)-[:SOURCED_FROM]->(c)
                     """,
                     fact_id=payload.fact_id,
                     generation=generation,

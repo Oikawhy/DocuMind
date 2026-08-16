@@ -59,11 +59,19 @@ def _make_snapshot(
     snapshot_id: str = "",
     generation: int = 1,
 ) -> ProjectionSnapshot:
-    records = tuple(
+    chunk_records = tuple(
         SnapshotRecord(
             deterministic_id=str(uuid.uuid4()),
-            canonical_payload_hash=hashlib.sha256(f"record-{i}".encode()).hexdigest(),
+            canonical_payload_hash=hashlib.sha256(f"chunk-{i}".encode()).hexdigest(),
             projection_type="chunk",
+        )
+        for i in range(n_records)
+    )
+    fact_records = tuple(
+        SnapshotRecord(
+            deterministic_id=str(uuid.uuid4()),
+            canonical_payload_hash=hashlib.sha256(f"fact-{i}".encode()).hexdigest(),
+            projection_type="fact",
         )
         for i in range(n_records)
     )
@@ -73,7 +81,7 @@ def _make_snapshot(
         version_id=str(uuid.uuid4()),
         generation=generation,
         tombstone_generation=0,
-        records=records,
+        records=chunk_records + fact_records,
     )
 
 
@@ -88,10 +96,10 @@ class InMemoryEvidenceStore:
     async def state_for(self, backend: ProjectionBackend, snapshot: ProjectionSnapshot) -> WriterOutcome | None:
         return self.outcomes.get(f"{backend}:{snapshot.snapshot_id}")
 
-    async def record_outcome(self, outcome: WriterOutcome) -> None:
+    async def record_outcome(self, outcome: WriterOutcome, *, snapshot: Any = None) -> None:
         self.outcomes[f"{outcome.backend}:{outcome.snapshot_id}"] = outcome
 
-    async def record_manifest(self, manifest: ProjectionManifest) -> None:
+    async def record_manifest(self, manifest: ProjectionManifest, *, snapshot: Any = None) -> None:
         self.manifests.append(manifest)
 
     async def record_incident(self, incident: Any) -> None:
@@ -117,13 +125,18 @@ class PassthroughWriter:
 
     async def project(self, snapshot: ProjectionSnapshot) -> ProjectionManifest:
         self.call_count += 1
+        # T6-08: Backend-specific record counting
+        if self._backend == ProjectionBackend.NEO4J:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "fact")
+        else:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "chunk")
         return ProjectionManifest(
             backend=self._backend,
             snapshot_id=snapshot.snapshot_id,
             generation=snapshot.generation,
             tombstone_generation=snapshot.tombstone_generation,
-            record_count=len(snapshot.records),
-            checksum=manifest_checksum(snapshot.records),
+            record_count=len(relevant),
+            checksum=manifest_checksum(relevant),
         )
 
 
@@ -355,8 +368,12 @@ async def test_coordinator_replay_uses_stored_evidence() -> None:
     snapshot = _make_snapshot()
     evidence = InMemoryEvidenceStore()
 
-    # Pre-populate evidence for all backends
+    # Pre-populate evidence for all backends with backend-specific counts
     for backend in ProjectionBackend:
+        if backend == ProjectionBackend.NEO4J:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "fact")
+        else:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "chunk")
         outcome = WriterOutcome(
             backend=backend,
             snapshot_id=snapshot.snapshot_id,
@@ -368,8 +385,8 @@ async def test_coordinator_replay_uses_stored_evidence() -> None:
                 snapshot_id=snapshot.snapshot_id,
                 generation=snapshot.generation,
                 tombstone_generation=snapshot.tombstone_generation,
-                record_count=len(snapshot.records),
-                checksum=manifest_checksum(snapshot.records),
+                record_count=len(relevant),
+                checksum=manifest_checksum(relevant),
             ),
         )
         evidence.outcomes[f"{backend}:{snapshot.snapshot_id}"] = outcome

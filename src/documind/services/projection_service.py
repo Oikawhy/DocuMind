@@ -111,9 +111,9 @@ class ProjectionEvidenceStore(Protocol):
 
     async def state_for(self, backend: ProjectionBackend, snapshot: ProjectionSnapshot) -> WriterOutcome | None: ...
 
-    async def record_outcome(self, outcome: WriterOutcome) -> None: ...
+    async def record_outcome(self, outcome: WriterOutcome, *, snapshot: ProjectionSnapshot | None = None) -> None: ...
 
-    async def record_manifest(self, manifest: ProjectionManifest) -> None: ...
+    async def record_manifest(self, manifest: ProjectionManifest, *, snapshot: ProjectionSnapshot | None = None) -> None: ...
 
 
 class ProjectionIncidentSink(Protocol):
@@ -214,14 +214,14 @@ class ProjectionCoordinator:
                         safe_error_class="integrity",
                     )
                     outcomes[backend] = outcome
-                    await self._evidence_store.record_outcome(outcome)
+                    await self._evidence_store.record_outcome(outcome, snapshot=snapshot)
                     return
                 if existing.status in {"projected", "verified"} and existing.manifest is not None:
                     outcomes[backend] = existing
                     return
             outcome = await self._write_backend(backend, snapshot)
             outcomes[backend] = outcome
-            await self._evidence_store.record_outcome(outcome)
+            await self._evidence_store.record_outcome(outcome, snapshot=snapshot)
 
         # Every task handles its own failure and records an outcome.  That lets
         # siblings settle instead of TaskGroup cancelling useful evidence.
@@ -239,14 +239,28 @@ class ProjectionCoordinator:
         return snapshot
 
     async def verify_snapshot(self, snapshot: ProjectionSnapshot) -> tuple[ProjectionManifest, ...]:
-        """Require three matching full manifests before completion is reachable."""
+        """Require three matching full manifests before completion is reachable.
+
+        T6-17: If process-local outcomes are absent (e.g. after worker
+        restart), reload from the durable evidence store.
+        """
         outcomes = self._outcomes.get(snapshot.snapshot_id)
+        if outcomes is None:
+            # Attempt to recover from durable evidence store
+            recovered: dict[ProjectionBackend, WriterOutcome] = {}
+            for backend in ProjectionBackend:
+                existing = await self._evidence_store.state_for(backend, snapshot)
+                if existing is not None:
+                    recovered[backend] = existing
+            if len(recovered) == len(ProjectionBackend):
+                outcomes = recovered
+                self._outcomes[snapshot.snapshot_id] = outcomes
         if outcomes is None:
             raise ProjectionIntegrityError("Projection verification has no recorded writer outcomes.")
         manifests: list[ProjectionManifest] = []
         for backend in ProjectionBackend:
             outcome = outcomes.get(backend)
-            if outcome is None or outcome.manifest is None or outcome.status != "projected":
+            if outcome is None or outcome.manifest is None or outcome.status not in {"projected", "verified"}:
                 raise ProjectionIntegrityError("Projection verification requires all writer outcomes.")
             expected = self._expected_manifest(snapshot, backend)
             if outcome.manifest != expected:
@@ -254,14 +268,28 @@ class ProjectionCoordinator:
                 raise ProjectionIntegrityError(f"{backend.value} manifest does not match the frozen snapshot.")
             manifests.append(outcome.manifest)
         for manifest in manifests:
-            await self._evidence_store.record_manifest(manifest)
+            await self._evidence_store.record_manifest(manifest, snapshot=snapshot)
         self._verified.add(snapshot.snapshot_id)
         return tuple(manifests)
 
     async def complete_snapshot(self, snapshot: ProjectionSnapshot) -> dict[str, int | str]:
-        """Make the one authoritative completion call after the final guard."""
+        """Make the one authoritative completion call after the final guard.
+
+        T6-17: If _verified is empty (e.g. after restart), check the
+        evidence store for verified state across all backends.
+        """
         if snapshot.snapshot_id not in self._verified:
-            raise ProjectionIntegrityError("Completion requires three verified projection manifests.")
+            # Attempt recovery from evidence store
+            all_verified = True
+            for backend in ProjectionBackend:
+                existing = await self._evidence_store.state_for(backend, snapshot)
+                if existing is None or existing.status != "verified":
+                    all_verified = False
+                    break
+            if all_verified:
+                self._verified.add(snapshot.snapshot_id)
+            else:
+                raise ProjectionIntegrityError("Completion requires three verified projection manifests.")
         await self._tombstone_guard.assert_active(snapshot.version_id, snapshot.tombstone_generation)
         await self._lifecycle_completer.complete_version(snapshot)
         return self.activity_output(snapshot, status="completed")
@@ -324,13 +352,18 @@ class ProjectionCoordinator:
         raise AssertionError("bounded backend retry loop exited unexpectedly")
 
     def _expected_manifest(self, snapshot: ProjectionSnapshot, backend: ProjectionBackend) -> ProjectionManifest:
+        # T6-08: Each backend's manifest covers only its own record type
+        if backend == ProjectionBackend.NEO4J:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "fact")
+        else:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "chunk")
         return ProjectionManifest(
             backend=backend,
             snapshot_id=snapshot.snapshot_id,
             generation=snapshot.generation,
             tombstone_generation=snapshot.tombstone_generation,
-            record_count=len(snapshot.records),
-            checksum=manifest_checksum(snapshot.records),
+            record_count=len(relevant),
+            checksum=manifest_checksum(relevant),
         )
 
     def _assert_replay_matches(

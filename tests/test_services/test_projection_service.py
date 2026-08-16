@@ -40,13 +40,18 @@ class Writer:
         self.calls += 1
         if self.calls <= self.transient_failures:
             raise ProjectionTransientError(f"{self.backend.value} unavailable")
-        checksum = manifest_checksum(snapshot.records)
+        # T6-08: Backend-specific record counting
+        if self.backend == ProjectionBackend.NEO4J:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "fact")
+        else:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "chunk")
+        checksum = manifest_checksum(relevant)
         return ProjectionManifest(
             backend=self.backend,
             snapshot_id=snapshot.snapshot_id,
             generation=snapshot.generation,
             tombstone_generation=snapshot.tombstone_generation,
-            record_count=len(snapshot.records),
+            record_count=len(relevant),
             checksum="different" if self.mismatched_manifest else checksum,
         )
 
@@ -60,11 +65,11 @@ class Evidence:
     async def state_for(self, backend: ProjectionBackend, snapshot: ProjectionSnapshot) -> WriterOutcome | None:
         return self.states.get(backend)
 
-    async def record_outcome(self, outcome: WriterOutcome) -> None:
+    async def record_outcome(self, outcome: WriterOutcome, *, snapshot: ProjectionSnapshot | None = None) -> None:
         self.outcomes.append(outcome)
         self.states[outcome.backend] = outcome
 
-    async def record_manifest(self, manifest: ProjectionManifest) -> None:
+    async def record_manifest(self, manifest: ProjectionManifest, *, snapshot: ProjectionSnapshot | None = None) -> None:
         self.manifests.append(manifest)
 
 

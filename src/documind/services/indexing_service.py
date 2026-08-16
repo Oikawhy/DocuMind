@@ -177,13 +177,15 @@ class QdrantProjectionWriter:
             except (ConnectionError, OSError, TimeoutError) as exc:
                 raise ProjectionTransientError(f"Qdrant upsert failed: {exc}") from exc
 
+        # T6-08: Count only chunk records for this backend's manifest
+        chunk_records = tuple(r for r in snapshot.records if r.projection_type == "chunk")
         return ProjectionManifest(
             backend=ProjectionBackend.QDRANT,
             snapshot_id=snapshot.snapshot_id,
             generation=snapshot.generation,
             tombstone_generation=snapshot.tombstone_generation,
-            record_count=len(snapshot.records),
-            checksum=manifest_checksum(snapshot.records),
+            record_count=len(chunk_records),
+            checksum=manifest_checksum(chunk_records),
         )
 
     async def delete_by_version(self, version_id: str) -> int:
@@ -325,13 +327,15 @@ class OpenSearchProjectionWriter:
                 if failed_items:
                     raise ProjectionTransientError(f"OpenSearch bulk had {len(failed_items)} errors")
 
+        # T6-08: Count only chunk records for this backend's manifest
+        chunk_records = tuple(r for r in snapshot.records if r.projection_type == "chunk")
         return ProjectionManifest(
             backend=ProjectionBackend.OPENSEARCH,
             snapshot_id=snapshot.snapshot_id,
             generation=snapshot.generation,
             tombstone_generation=snapshot.tombstone_generation,
-            record_count=len(snapshot.records),
-            checksum=manifest_checksum(snapshot.records),
+            record_count=len(chunk_records),
+            checksum=manifest_checksum(chunk_records),
         )
 
     @staticmethod

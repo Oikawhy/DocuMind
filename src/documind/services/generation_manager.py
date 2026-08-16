@@ -56,10 +56,35 @@ class ActiveGenerationManager:
     ) -> None:
         """Atomically switch the active generation pointer.
 
+        T6-18: Verifies that the referenced ``ProjectionState`` has
+        ``state='verified'`` before updating the pointer.  Raises
+        ``ValueError`` if the generation is not verified.
+
         Upserts the ``active_projection_generation`` row for this
         (kind, scope_key) to point at the given generation.
         """
         async with self._session_factory() as session, session.begin():
+            # T6-18: Guard — require verified state before activation
+            state_row = (
+                await session.execute(
+                    select(ProjectionState).where(
+                        ProjectionState.projection_kind == kind,
+                        ProjectionState.scope_key == scope_key,
+                        ProjectionState.generation == generation,
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if state_row is None:
+                raise ValueError(
+                    f"No projection state found for {kind}/{scope_key} generation {generation}"
+                )
+            if state_row.state != "verified":
+                raise ValueError(
+                    f"Cannot activate {kind}/{scope_key} generation {generation}: "
+                    f"state is '{state_row.state}', expected 'verified'"
+                )
+
             row = (
                 await session.execute(
                     select(ActiveProjectionGeneration).where(

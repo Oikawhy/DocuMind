@@ -3,6 +3,11 @@
 Each rebuild workflow targets one projection backend (qdrant, opensearch, neo4j),
 replays canonical non-tombstoned facts/chunks, verifies counts/checksums, and
 atomically switches the active generation pointer per §6.2.
+
+T6-22: Rebuild activities now respect scope/scope_id and fan out to only
+       the named backend instead of the full coordinator fanout.
+T6-23: Rebuilds allocate a new generation before replaying data.
+T6-13: Neo4j-specific rebuilds use Neo4jGraphRebuilder when available.
 """
 
 from __future__ import annotations
@@ -72,6 +77,18 @@ def configure_rebuild_activities(
     _generation_manager = generation_manager
 
 
+def _build_snapshot_id(backend: str, scope: str, scope_id: str | None) -> str:
+    """Construct the canonical snapshot_id for a rebuild.
+
+    T6-22: Scope-aware snapshot_id construction.
+    - scope="full":     rebuild-{backend}-full
+    - scope="version":  rebuild-{backend}-{scope_id}
+    """
+    if scope == "version" and scope_id:
+        return f"rebuild-{backend}-{scope_id}"
+    return f"rebuild-{backend}-full"
+
+
 # ---------------------------------------------------------------------------
 # Activities
 # ---------------------------------------------------------------------------
@@ -81,18 +98,29 @@ def configure_rebuild_activities(
 async def rebuild_projection(input_data: dict[str, Any]) -> dict[str, Any]:
     """Replay canonical facts/chunks for one backend into a new generation.
 
-    The activity receives a snapshot_id that identifies the frozen canonical
-    data to replay. The coordinator resolves and projects it.
+    T6-22: Uses scope-aware snapshot ID construction.
+    T6-23: Allocates a replacement generation before projecting.
+    T6-13: Uses Neo4jGraphRebuilder for Neo4j-specific rebuilds.
     """
     coordinator = _coordinator
     if coordinator is None:
         raise RuntimeError("Rebuild activities have not been configured.")
 
-    snapshot_id = input_data["snapshot_id"]
     backend = input_data["backend"]
+    snapshot_id = input_data["snapshot_id"]
+    generation = input_data.get("generation")
 
     activity.heartbeat({"phase": "rebuilding", "backend": backend})
 
+    # T6-13: Use dedicated Neo4j rebuilder when available
+    if backend == "neo4j" and _neo4j_rebuilder is not None:
+        snapshot = await coordinator.snapshot(snapshot_id)
+        count = await _neo4j_rebuilder.rebuild(snapshot=snapshot, new_generation=generation or 1)
+        output = coordinator.activity_output(snapshot, status="rebuilt")
+        output["record_count"] = count
+        return output
+
+    # Default: use coordinator for the specified backend
     snapshot = await coordinator.project_snapshot(snapshot_id)
     return coordinator.activity_output(snapshot, status="rebuilt")
 
@@ -144,16 +172,20 @@ class RebuildProjectionWorkflow:
     """Rebuild one projection backend from canonical PostgreSQL data.
 
     Steps:
+    0. allocate_generation — reserve a new generation number (T6-23)
     1. rebuild_projection — replay canonical data into new generation
     2. verify_rebuild — count/checksum comparison
     3. activate_generation — atomically switch active pointer
 
     The prior verified generation remains active during rebuild (no gap).
+    T6-22: scope/scope_id are propagated to the snapshot_id and activities.
+    T6-24: On verification failure, one retry with a fresh generation is
+    attempted before marking the projection unhealthy.
     """
 
     @workflow.run
     async def run(self, input: RebuildProjectionInput) -> RebuildProjectionOutput:
-        """Execute the three-phase rebuild cycle."""
+        """Execute the rebuild cycle."""
         retry = RetryPolicy(
             initial_interval=timedelta(seconds=30),
             backoff_coefficient=2.0,
@@ -161,20 +193,27 @@ class RebuildProjectionWorkflow:
             maximum_attempts=3,
         )
 
+        # T6-22: Build scope-aware snapshot_id
+        snapshot_id = _build_snapshot_id(input.backend, input.scope, input.scope_id)
+        scope_key = input.scope_id or "global"
+
+        # T6-23: Allocate a new generation before rebuild
+        generation = await self._allocate_generation(input.backend, scope_key, retry)
+
         # Phase 1: Rebuild
         rebuild_result = await workflow.execute_activity(
             rebuild_projection,
             {
-                "snapshot_id": f"rebuild-{input.backend}-{input.scope}",
+                "snapshot_id": snapshot_id,
                 "backend": input.backend,
+                "generation": generation,
             },
             start_to_close_timeout=timedelta(minutes=30),
             heartbeat_timeout=timedelta(minutes=5),
             retry_policy=retry,
         )
 
-        snapshot_id = rebuild_result.get("snapshot_id", "")
-        generation = rebuild_result.get("generation", 0)
+        generation = rebuild_result.get("generation", generation)
 
         # Phase 2: Verify
         verify_result = await workflow.execute_activity(
@@ -187,9 +226,38 @@ class RebuildProjectionWorkflow:
 
         verified = verify_result.get("status") == "verified"
 
+        # T6-24: Recovery — retry once with fresh generation on verification failure
+        if not verified:
+            workflow.logger.warning(
+                "Verification failed for %s/%s gen %d; retrying with fresh generation",
+                input.backend,
+                scope_key,
+                generation,
+            )
+            generation = await self._allocate_generation(input.backend, scope_key, retry)
+            rebuild_result = await workflow.execute_activity(
+                rebuild_projection,
+                {
+                    "snapshot_id": snapshot_id,
+                    "backend": input.backend,
+                    "generation": generation,
+                },
+                start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=5),
+                retry_policy=retry,
+            )
+            generation = rebuild_result.get("generation", generation)
+            verify_result = await workflow.execute_activity(
+                verify_rebuild,
+                {"snapshot_id": snapshot_id, "backend": input.backend},
+                start_to_close_timeout=timedelta(minutes=5),
+                heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=retry,
+            )
+            verified = verify_result.get("status") == "verified"
+
         # Phase 3: Activate (only if verified)
         activated = False
-        scope_key = input.scope_id or "global"
         if verified:
             activate_result = await workflow.execute_activity(
                 activate_generation,
@@ -212,3 +280,21 @@ class RebuildProjectionWorkflow:
             verified=verified,
             activated=activated,
         )
+
+    @staticmethod
+    async def _allocate_generation(
+        backend: str, scope_key: str, retry: RetryPolicy,
+    ) -> int:
+        """Allocate a new generation via the generation manager activity.
+
+        T6-23: Pre-rebuild generation allocation ensures each rebuild
+        writes to a fresh namespace that does not overwrite the active one.
+        """
+        result = await workflow.execute_activity(
+            "allocate_generation",
+            {"backend": backend, "scope_key": scope_key},
+            start_to_close_timeout=timedelta(minutes=2),
+            heartbeat_timeout=timedelta(seconds=30),
+            retry_policy=retry,
+        )
+        return result.get("generation", 1)

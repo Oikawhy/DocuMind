@@ -58,13 +58,18 @@ class ConcurrentWriter:
         self.tracker.maximum_active = max(self.tracker.maximum_active, self.tracker.active)
         await asyncio.sleep(0)
         self.tracker.active -= 1
+        # T6-08: Backend-specific record counting
+        if self.backend == ProjectionBackend.NEO4J:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "fact")
+        else:
+            relevant = tuple(r for r in snapshot.records if r.projection_type == "chunk")
         return ProjectionManifest(
             backend=self.backend,
             snapshot_id=snapshot.snapshot_id,
             generation=snapshot.generation,
             tombstone_generation=snapshot.tombstone_generation,
-            record_count=len(snapshot.records),
-            checksum=manifest_checksum(snapshot.records),
+            record_count=len(relevant),
+            checksum=manifest_checksum(relevant),
         )
 
 
@@ -76,10 +81,10 @@ class Evidence:
     async def state_for(self, backend: ProjectionBackend, snapshot: ProjectionSnapshot) -> object | None:
         return None
 
-    async def record_outcome(self, outcome: object) -> None:
+    async def record_outcome(self, outcome: object, **kwargs: object) -> None:
         self.outcomes.append(outcome)
 
-    async def record_manifest(self, manifest: ProjectionManifest) -> None:
+    async def record_manifest(self, manifest: ProjectionManifest, **kwargs: object) -> None:
         self.manifests.append(manifest)
 
 

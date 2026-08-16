@@ -42,10 +42,12 @@ class Neo4jLocalRetrievalBackend:
         driver: Any,
         database: str = "neo4j",
         max_hops: int = 2,
+        generation_manager: Any | None = None,
     ) -> None:
         self._driver = driver
         self._database = database
         self._max_hops = max_hops
+        self._generation_manager = generation_manager
 
     @property
     def name(self) -> str:
@@ -127,9 +129,18 @@ class Neo4jLocalRetrievalBackend:
     async def _get_active_generation(self) -> int | None:
         """Query the active verified graph generation.
 
-        Looks for the most recent verified generation by checking
-        the highest generation number that has at least one Fact node.
+        T6-19: Prefers the ``ActiveGenerationManager`` registry when
+        available.  Falls back to querying Neo4j ``max(f.generation)``
+        only when no manager is injected.
         """
+        if self._generation_manager is not None:
+            try:
+                return await self._generation_manager.current("neo4j", "global")
+            except Exception as exc:
+                logger.warning("neo4j_generation_manager_failed", error=str(exc))
+                return None
+
+        # Fallback: query Neo4j directly (not recommended — T6-19)
         cypher = """
         MATCH (f:Fact)
         WHERE f.tombstone_generation = 0

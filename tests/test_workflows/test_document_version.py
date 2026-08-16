@@ -73,7 +73,9 @@ def test_full_stage_order_matches_pipeline_contract() -> None:
 
 
 def test_stage_task_queue_assignments() -> None:
-    """Inspect/parse/normalize/chunk run on ingest-cpu; enrich runs on model-gpu."""
+    """Inspect/parse/normalize/chunk on ingest-cpu; enrich on model-gpu; project on project-gpu; verify/complete on project-cpu."""
+    from documind.workflows.document_version import PROJECT_CPU_QUEUE, PROJECT_GPU_QUEUE
+
     stages = DocumentVersionWorkflow.stage_configurations()
     queue_map = {stage.name: stage.task_queue for stage in stages}
     assert queue_map == {
@@ -82,9 +84,9 @@ def test_stage_task_queue_assignments() -> None:
         "normalize": INGEST_QUEUE,
         "chunk": INGEST_QUEUE,
         "enrich": MODEL_QUEUE,
-        "project": INGEST_QUEUE,
-        "verify": INGEST_QUEUE,
-        "complete": INGEST_QUEUE,
+        "project": PROJECT_GPU_QUEUE,
+        "verify": PROJECT_CPU_QUEUE,
+        "complete": PROJECT_CPU_QUEUE,
     }
 
 
