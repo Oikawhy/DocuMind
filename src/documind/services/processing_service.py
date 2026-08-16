@@ -136,8 +136,15 @@ class NormalizedDocumentSource:
         normalized_object_key: str | None,
         expected_version_id: uuid.UUID,
         expected_content_sha256: str,
+        expected_normalization_revision: str | None = None,
     ) -> NormalizeResult:
-        """Load, verify, and return the canonical normalized representation."""
+        """Load, verify, and return the canonical normalized representation.
+
+        T5.2-01: Cross-checks ``expected_normalization_revision`` when provided.
+        T5.2-02: Requires ``text`` and ``blocks`` instead of defaulting to empty.
+        T5.2-03: Validates structural types for pages, offset_map,
+        language_evidence, and parser_attempts.
+        """
         if not normalized_object_key:
             raise NormalizationIntegrityError("No normalized_object_key set on the document version.")
 
@@ -161,9 +168,15 @@ class NormalizedDocumentSource:
                 f"Version ID mismatch: expected '{expected_version_id}', got '{stored_version_id}'."
             )
 
+        # T5.2-02: Require text — reject missing or non-string values.
+        text = payload.get("text")
+        if text is None or not isinstance(text, str):
+            raise NormalizationIntegrityError("Missing or invalid 'text' in normalized artifact.")
+        if not text:
+            raise NormalizationIntegrityError("Normalized artifact text is empty.")
+
         # Verify content hash
-        text = payload.get("text", "")
-        actual_sha256 = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+        actual_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
         stored_sha256 = payload.get("content_sha256", "")
         if actual_sha256 != stored_sha256:
             raise NormalizationIntegrityError("Content SHA-256 does not match the stored text.")
@@ -175,22 +188,46 @@ class NormalizedDocumentSource:
         if not normalization_revision or not isinstance(normalization_revision, str):
             raise NormalizationIntegrityError("Missing or invalid normalization_revision.")
 
-        # Validate blocks
-        raw_blocks = payload.get("blocks", [])
+        # T5.2-01: Cross-check normalization revision against version metadata.
+        if expected_normalization_revision is not None:
+            if normalization_revision != expected_normalization_revision:
+                raise NormalizationIntegrityError(
+                    f"Normalization revision mismatch: expected '{expected_normalization_revision}', "
+                    f"got '{normalization_revision}'."
+                )
+
+        # T5.2-02: Require blocks — reject missing values.
+        raw_blocks = payload.get("blocks")
+        if raw_blocks is None:
+            raise NormalizationIntegrityError("Missing 'blocks' in normalized artifact.")
         if not isinstance(raw_blocks, list):
             raise NormalizationIntegrityError("Blocks must be a list.")
 
         blocks = _validate_block_records(raw_blocks, len(text))
 
+        # T5.2-03: Validate structural types for canonical fields.
+        pages = payload.get("pages")
+        if pages is None or not isinstance(pages, list):
+            raise NormalizationIntegrityError("Missing or invalid 'pages' in normalized artifact.")
+        offset_map = payload.get("offset_map")
+        if offset_map is None or not isinstance(offset_map, list):
+            raise NormalizationIntegrityError("Missing or invalid 'offset_map' in normalized artifact.")
+        language_evidence = payload.get("language_evidence")
+        if language_evidence is None or not isinstance(language_evidence, list):
+            raise NormalizationIntegrityError("Missing or invalid 'language_evidence' in normalized artifact.")
+        parser_attempts = payload.get("parser_attempts")
+        if parser_attempts is None or not isinstance(parser_attempts, list):
+            raise NormalizationIntegrityError("Missing or invalid 'parser_attempts' in normalized artifact.")
+
         return NormalizeResult(
             version_id=str(expected_version_id),
             normalization_revision=normalization_revision,
             text=text,
-            pages=payload.get("pages", []),
-            offset_map=payload.get("offset_map", []),
-            language_evidence=payload.get("language_evidence", []),
+            pages=pages,
+            offset_map=offset_map,
+            language_evidence=language_evidence,
             content_sha256=stored_sha256,
-            parser_attempts=payload.get("parser_attempts", []),
+            parser_attempts=parser_attempts,
             blocks=blocks,
             normalized_object_key=normalized_object_key,
         )
