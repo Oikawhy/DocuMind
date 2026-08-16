@@ -30,6 +30,8 @@ dependencies = [
     "prometheus-client>=0.20.0",
     "cloudevents>=1.10.0",
     "PyJWT[crypto]>=2.7.0",
+    "langgraph>=0.2.0",
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]

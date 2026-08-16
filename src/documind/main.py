@@ -36,6 +36,9 @@ from documind.services.audit_service import AuditService
 from documind.services.identity_service import IdentityService
 from documind.services.partition_service import ensure_audit_partitions
 from documind.services.secret_service import SecretService
+from documind.services.bge_adapter import BGECrossEncoderAdapter
+from documind.services.reranker_service import RerankerService
+from documind.services.retrieval_service import RetrievalService
 from documind.services.storage_service import StorageService
 from documind.services.webhook_service import WebhookService
 
@@ -118,7 +121,135 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if secret_client is not None:
             await secret_client.close()
 
+    # T7-01: Wire RetrievalService with BGE reranker sidecar and backend adapters.
+    bge_adapter: BGECrossEncoderAdapter | None = None
+    try:
+        bge_adapter = BGECrossEncoderAdapter(
+            sidecar_url=settings.reranker_sidecar_url,
+            timeout_ms=settings.reranker_timeout_ms,
+        )
+        reranker = RerankerService(
+            encoder=bge_adapter,
+            threshold=settings.retrieval_reranker_threshold,
+            max_results=settings.retrieval_max_evidence,
+        )
+
+        # Build backend dictionary.  Backend adapters are imported lazily so
+        # the API server can start even when a data-store library is absent.
+        backends: dict[str, object] = {}
+        try:
+            from qdrant_client import AsyncQdrantClient
+
+            from documind.services.backends.qdrant_backend import QdrantRetrievalBackend
+
+            qdrant_client = AsyncQdrantClient(
+                host=settings.qdrant_host, port=settings.qdrant_port,
+            )
+            backends["qdrant"] = QdrantRetrievalBackend(
+                client=qdrant_client,
+                collection=settings.qdrant_collection,
+            )
+        except Exception:
+            logger.warning("qdrant_backend_unavailable")
+
+        try:
+            from opensearchpy import AsyncOpenSearch
+
+            from documind.services.backends.opensearch_backend import OpenSearchRetrievalBackend
+
+            os_client = AsyncOpenSearch(
+                hosts=[{"host": settings.opensearch_host, "port": settings.opensearch_port}],
+                use_ssl=False,
+            )
+            backends["opensearch"] = OpenSearchRetrievalBackend(
+                client=os_client,
+                index_name=settings.opensearch_index,
+            )
+        except Exception:
+            logger.warning("opensearch_backend_unavailable")
+
+        try:
+            from neo4j import AsyncGraphDatabase
+
+            from documind.services.backends.neo4j_local_backend import Neo4jLocalRetrievalBackend
+            from documind.services.backends.neo4j_global_backend import Neo4jGlobalRetrievalBackend
+
+            neo4j_auth_ref = settings.neo4j_auth_ref
+            if neo4j_auth_ref and secret_client is not None:
+                neo4j_user = await secret_client.get_secret("documind/neo4j", "user")
+                neo4j_pass = await secret_client.get_secret("documind/neo4j", "password")
+                auth_tuple: tuple[str, str] | None = (neo4j_user, neo4j_pass) if neo4j_user else None
+            else:
+                auth_tuple = None
+
+            neo4j_driver = AsyncGraphDatabase.driver(settings.neo4j_uri, auth=auth_tuple)
+            backends["neo4j_local"] = Neo4jLocalRetrievalBackend(
+                driver=neo4j_driver,
+                max_hops=settings.neo4j_max_hops_local,
+            )
+            backends["neo4j_global"] = Neo4jGlobalRetrievalBackend(
+                driver=neo4j_driver,
+                max_sources=settings.neo4j_max_sources_global,
+            )
+        except Exception:
+            logger.warning("neo4j_backends_unavailable")
+
+        if backends:
+            app.state.retrieval_service = RetrievalService(
+                session_factory=app.state.session_factory,
+                authorization_service=app.state.authorization_service,
+                policy_service=app.state.policy_service,
+                reranker=reranker,
+                backends=backends,  # type: ignore[arg-type]
+                rrf_constant=settings.retrieval_rrf_constant,
+                max_candidates=settings.retrieval_max_candidates,
+                max_evidence=settings.retrieval_max_evidence,
+                reranker_threshold=settings.retrieval_reranker_threshold,
+                budget_ms=settings.retrieval_budget_ms,
+                enabled_modes=settings.retrieval_enabled_modes,
+                default_mode=settings.retrieval_default_mode,
+            )
+            logger.info("retrieval_service_wired", backends=list(backends.keys()))
+        else:
+            logger.warning("retrieval_service_unavailable", reason="no_backends")
+    except Exception:
+        logger.exception("retrieval_service_wiring_failed")
+
+    # T8-01: Wire RAGService with LangGraph pipeline.
+    try:
+        retrieval_svc = getattr(app.state, "retrieval_service", None)
+        llm_svc = getattr(app.state, "llm_service", None)
+        if retrieval_svc is not None:
+            from documind.rag.graph import build_graph
+            from documind.rag.prompts.registry import build_default_registry
+            from documind.rag.service import RAGService
+
+            prompt_registry = build_default_registry()
+            compiled_graph = build_graph(
+                llm_service=llm_svc,
+                retrieval_service=retrieval_svc,
+                reranker_service=reranker,
+                session_factory=app.state.session_factory,
+                audit_service=app.state.audit_service,
+                prompt_registry=prompt_registry,
+            )
+            app.state.rag_service = RAGService(
+                compiled_graph=compiled_graph,
+                session_factory=app.state.session_factory,
+                llm_service=llm_svc,
+                audit_service=app.state.audit_service,
+            )
+            logger.info("rag_service_wired")
+        else:
+            logger.warning("rag_service_unavailable", reason="no_retrieval_service")
+    except Exception:
+        logger.exception("rag_service_wiring_failed")
+
     yield
+
+    # Shutdown: close the BGE adapter HTTP client.
+    if bge_adapter is not None:
+        await bge_adapter.close()
 
 
 logger = structlog.get_logger()

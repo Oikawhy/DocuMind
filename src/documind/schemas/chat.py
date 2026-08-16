@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -43,10 +44,12 @@ class ChatResponse(BaseModel):
     answer: str
     abstained: bool = False
     citations: list[CitationOut] = Field(default_factory=list)
-    confidence: float | None = None
+    confidence: Literal["high", "medium", "low"] | None = None
     route: str | None = None
     agent_path: list[str] = Field(default_factory=list)
     policy_revisions: list[str] = Field(default_factory=list)
+    model_route_revisions: dict[str, int] = Field(default_factory=dict)
+    limitation_code: str | None = None
     trace_id: uuid.UUID
 
 
