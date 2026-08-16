@@ -20,6 +20,7 @@ from documind.services.enrichment_service import EnrichmentService
 from documind.workflows.activities.inspect import (
     TombstoneGuard,
     _assert_active,
+    _heartbeat_loop,
     _run_stage,
     _with_stage_checksum,
 )
@@ -73,10 +74,13 @@ async def enrich(stage: StageExecution) -> dict[str, Any]:
                 "facts_corroborated": (result.fact_result.facts_corroborated if result.fact_result else 0),
             },
             "errors": result.errors,
-            "route_revision_ids": [str(rid) for rid in (getattr(result, "route_revision_ids", None) or [])],
+            # T5.6-03: Use actual field, not getattr fallback.
+            "route_revision_ids": [str(rid) for rid in result.route_revision_ids],
         }
 
-    output = await _run_stage(stage, execute, max_attempts=2)
+    # T5.6-02: Wrap with periodic heartbeat loop.
+    async with _heartbeat_loop(stage):
+        output = await _run_stage(stage, execute, max_attempts=2)
     await _assert_active(stage)
     activity.heartbeat({"stage": stage.name, "version_id": stage.version_id, "complete": True})
     return _with_stage_checksum(output)

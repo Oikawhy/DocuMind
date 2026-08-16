@@ -214,32 +214,14 @@ class DocumentVersionWorkflow:
         enrich_stage = _stage_execution(workflow_input.version_id, "enrich", current_checksum)
         enriched = await self._execute_stage("enrich", enrich_stage)
 
-        # --- Stage 6: project ---
-        # The snapshot identity is the enriched-output checksum.  Project,
-        # verify, and complete all reference the same frozen snapshot so
-        # the coordinator can match outcomes across all three stages.
-        snapshot_checksum = _payload_sha256(enriched)
-        project_stage = _stage_execution(workflow_input.version_id, "project", snapshot_checksum)
-        projected = await self._execute_stage("project", project_stage)
-
-        # --- Stage 7: verify ---
-        # Same snapshot identity — verify looks up outcomes recorded by project.
-        verify_stage = _stage_execution(workflow_input.version_id, "verify", snapshot_checksum)
-        verified = await self._execute_stage("verify", verify_stage)  # noqa: F841
-
-        # --- Stage 8: complete ---
-        # Same snapshot identity — complete checks verified set from verify.
-        complete_stage = _stage_execution(workflow_input.version_id, "complete", snapshot_checksum)
-        completed = await self._execute_stage("complete", complete_stage)
-
+        # --- End of Task 5 scope ---
+        # T5.6-01: Task 6 owns project, verify, and complete.
         return DocumentVersionWorkflowResult(
             version_id=workflow_input.version_id,
-            state="completed",
+            state="processing",
             normalization=normalized,
             chunk=chunked,
             enrichment=enriched,
-            projection=projected,
-            completion=completed,
         )
 
     async def _execute_stage(

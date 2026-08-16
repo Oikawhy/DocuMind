@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
-from dataclasses import asdict
 from typing import Any
 
 from temporalio import activity
@@ -46,7 +46,15 @@ async def parse(stage: StageExecution) -> dict[str, Any]:
     await _assert_active(stage)
 
     async def execute() -> dict[str, Any]:
-        return asdict(await service.parse(uuid.UUID(stage.version_id)))
+        # T5.6-04: Return only checksums and metadata, not document text.
+        result = await service.parse(uuid.UUID(stage.version_id))
+        content_sha256 = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+        return {
+            "success": True,
+            "content_sha256": content_sha256,
+            "page_count": len(result.pages),
+            "parser_used": getattr(result, "parser_used", None),
+        }
 
     async with _heartbeat_loop(stage):
         output = await _run_stage(stage, execute, max_attempts=2)

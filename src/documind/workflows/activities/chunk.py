@@ -26,6 +26,7 @@ from documind.services.chunking_service import (
 from documind.workflows.activities.inspect import (
     TombstoneGuard,
     _assert_active,
+    _heartbeat_loop,
     _run_stage,
     _with_stage_checksum,
 )
@@ -106,6 +107,8 @@ async def chunk(stage: StageExecution) -> dict[str, Any]:
         else:
             profile = _build_chunk_profile(normalization)
         chunks = service.chunk(normalized, profile)
+        # T5.6-04: Check tombstone before durable write.
+        await _assert_active(stage)
         result = await writer.write_chunks(version_id, profile.revision_id, chunks)
         # Include profile/effective-profile and chunk count/checksum in output
         result.setdefault("profile_revision_id", str(profile.revision_id))
@@ -115,7 +118,9 @@ async def chunk(stage: StageExecution) -> dict[str, Any]:
         result.setdefault("embedding_model_digest", profile.embedding_model_digest)
         return result
 
-    output = await _run_stage(stage, execute, max_attempts=3)
+    # T5.6-02: Wrap with periodic heartbeat loop.
+    async with _heartbeat_loop(stage):
+        output = await _run_stage(stage, execute, max_attempts=3)
     await _assert_active(stage)
     activity.heartbeat({"stage": stage.name, "version_id": stage.version_id, "complete": True})
     return _with_stage_checksum(output)
