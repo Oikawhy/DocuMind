@@ -186,6 +186,28 @@ class QdrantProjectionWriter:
             checksum=manifest_checksum(snapshot.records),
         )
 
+    async def delete_by_version(self, version_id: str) -> int:
+        """Delete all points for a tombstoned/erased version."""
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+        except ImportError as exc:
+            raise ProjectionTransientError(
+                "qdrant_client.models is required for delete operations"
+            ) from exc
+
+        try:
+            await self._client.delete(
+                self._collection,
+                points_selector=Filter(
+                    must=[FieldCondition(key="version_id", match=MatchValue(value=version_id))]
+                ),
+                wait=True,
+            )
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            raise ProjectionTransientError(f"Qdrant delete failed: {exc}") from exc
+        logger.info("Deleted Qdrant points for version %s", version_id)
+        return 0  # Qdrant delete doesn't return count
+
 
 # ---------------------------------------------------------------------------
 # OpenSearch writer
@@ -315,7 +337,7 @@ class OpenSearchProjectionWriter:
     @staticmethod
     def _build_bulk_body(payloads: list[ChunkProjectionPayload]) -> str:
         """Build an NDJSON bulk request body for idempotent upsert."""
-        lines: list[str] = []
+        lines = []
         for payload in payloads:
             action = json.dumps({"index": {"_id": payload.chunk_id}})
             doc = json.dumps(
@@ -340,3 +362,16 @@ class OpenSearchProjectionWriter:
             lines.append(action)
             lines.append(doc)
         return "\n".join(lines) + "\n"
+
+    async def delete_by_version(self, version_id: str) -> int:
+        """Delete all documents for a tombstoned/erased version."""
+        try:
+            result = await self._client.delete_by_query(
+                index=self._index,
+                body={"query": {"term": {"version_id": version_id}}},
+            )
+            deleted = result.get("deleted", 0)
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            raise ProjectionTransientError(f"OpenSearch delete failed: {exc}") from exc
+        logger.info("Deleted %d OpenSearch documents for version %s", deleted, version_id)
+        return deleted

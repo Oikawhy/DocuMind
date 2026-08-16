@@ -56,17 +56,20 @@ class RebuildProjectionOutput:
 
 _coordinator: ProjectionCoordinator | None = None
 _neo4j_rebuilder: Neo4jGraphRebuilder | None = None
+_generation_manager: Any = None
 
 
 def configure_rebuild_activities(
     coordinator: ProjectionCoordinator,
     *,
     neo4j_rebuilder: Neo4jGraphRebuilder | None = None,
+    generation_manager: Any = None,
 ) -> None:
     """Inject worker-owned rebuild dependencies."""
-    global _coordinator, _neo4j_rebuilder
+    global _coordinator, _neo4j_rebuilder, _generation_manager
     _coordinator = coordinator
     _neo4j_rebuilder = neo4j_rebuilder
+    _generation_manager = generation_manager
 
 
 # ---------------------------------------------------------------------------
@@ -116,18 +119,19 @@ async def verify_rebuild(input_data: dict[str, Any]) -> dict[str, Any]:
 @activity.defn(name="activate_generation")
 async def activate_generation(input_data: dict[str, Any]) -> dict[str, Any]:
     """Atomically switch active generation pointer after verification."""
-    coordinator = _coordinator
-    if coordinator is None:
-        raise RuntimeError("Rebuild activities have not been configured.")
+    manager = _generation_manager
+    if manager is None:
+        raise RuntimeError("Rebuild activities have not been configured with a generation manager.")
 
-    snapshot_id = input_data["snapshot_id"]
     backend = input_data["backend"]
+    generation = input_data["generation"]
+    scope_key = input_data.get("scope_key", "global")
 
     activity.heartbeat({"phase": "activating", "backend": backend})
 
-    snapshot = await coordinator.snapshot(snapshot_id)
-    result = await coordinator.complete_snapshot(snapshot)
-    return dict(result)
+    await manager.activate(backend, scope_key, generation)
+
+    return {"status": "completed", "backend": backend, "generation": generation}
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +189,15 @@ class RebuildProjectionWorkflow:
 
         # Phase 3: Activate (only if verified)
         activated = False
+        scope_key = input.scope_id or "global"
         if verified:
             activate_result = await workflow.execute_activity(
                 activate_generation,
-                {"snapshot_id": snapshot_id, "backend": input.backend},
+                {
+                    "backend": input.backend,
+                    "generation": generation,
+                    "scope_key": scope_key,
+                },
                 start_to_close_timeout=timedelta(minutes=2),
                 heartbeat_timeout=timedelta(seconds=30),
                 retry_policy=retry,
