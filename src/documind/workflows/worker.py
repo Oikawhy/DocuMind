@@ -330,32 +330,44 @@ def _build_enrichment_service(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> Any:
-    """Build an EnrichmentService with stub dependencies.
+    """Build an EnrichmentService with production LLM and graph fact adapters.
 
-    Production enrichment requires a real LLMService (with route resolver,
-    credential resolver, and LiteLLM adapter), a GraphFactService, and a
-    VersionLoader.  These stubs fail cleanly with descriptive errors rather
-    than crashing with AttributeError on uninitialized ``__new__`` members.
+    T5.4-01/T5.5-01: Uses PostgresRouteResolver, LiteLLMAdapter,
+    OpenBaoCredentialResolver, and GraphFactService instead of stubs.
+    VersionLoader remains a minimal implementation until Task 6 adds
+    the full projection/verification schema.
     """
     from documind.services.enrichment_service import EnrichmentService
-    from documind.services.graph_fact_service import FactPersistenceResult
-    from documind.services.llm_service import ModelRouteError
+    from documind.services.graph_fact_service import GraphFactService
+    from documind.services.llm_adapters import (
+        LiteLLMAdapter,
+        OpenBaoCredentialResolver,
+        PostgresRouteResolver,
+    )
+    from documind.services.llm_service import LLMService
 
-    class _StubRouteResolver:
-        async def newest_active(self, role: Any) -> None:
-            return None
+    route_resolver = PostgresRouteResolver(session_factory)
+    adapter = LiteLLMAdapter()
+    credential_resolver = OpenBaoCredentialResolver(
+        openbao_addr=getattr(settings, "openbao_addr", ""),
+        openbao_token_path=getattr(settings, "openbao_token_path", ""),
+    )
 
-    class _StubLLM:
-        """Stub LLM that reports no active routes."""
+    # Audit sink: use structlog for now; production audit_service requires
+    # its own session_factory wiring in Task 6.
+    class _StructlogAuditSink:
+        async def record(self, audit_data: dict[str, Any]) -> None:
+            import structlog
 
-        _route_resolver = _StubRouteResolver()
+            structlog.get_logger("llm_audit").info("llm_audit_event", **audit_data)
 
-        async def invoke(self, role: Any, messages: Any, *, json_schema: Any = None) -> Any:
-            raise ModelRouteError("LLM service requires production route configuration.")
-
-    class _StubGraphFactService:
-        async def persist_facts(self, **kwargs: Any) -> FactPersistenceResult:
-            return FactPersistenceResult()
+    llm_service = LLMService(
+        route_resolver=route_resolver,
+        adapter=adapter,
+        credential_resolver=credential_resolver,
+        audit_sink=_StructlogAuditSink(),
+    )
+    graph_fact_service = GraphFactService(session_factory=session_factory)
 
     class _StubVersionLoader:
         def __init__(self, sf: async_sessionmaker[AsyncSession]) -> None:
@@ -371,7 +383,16 @@ def _build_enrichment_service(
                 return version
 
         async def load_chunks(self, version_id: Any) -> list[Any]:
-            return []
+            from documind.models.chunk import DocumentChunk
+
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    select(DocumentChunk).where(
+                        DocumentChunk.version_id == version_id,
+                        DocumentChunk.tombstone_generation == 0,
+                    ).order_by(DocumentChunk.chunk_index)
+                )
+                return list(result.scalars().all())
 
         async def load_template(self, revision_id: Any) -> None:
             return None
@@ -389,8 +410,8 @@ def _build_enrichment_service(
             pass
 
     return EnrichmentService(
-        llm_service=_StubLLM(),
-        graph_fact_service=_StubGraphFactService(),
+        llm_service=llm_service,
+        graph_fact_service=graph_fact_service,
         version_loader=_StubVersionLoader(session_factory),
     )
 
