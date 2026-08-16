@@ -570,11 +570,20 @@ class _PostgresChunkWriter:
                         f"Retry chunk count {len(chunks)} differs from persisted {len(existing)}"
                     )
                 for persisted, candidate in zip(existing, chunks, strict=True):
+                    # T5.3-09: Compare ALL immutable fields on replay, not just
+                    # a subset. This catches silent divergence from any field.
                     if (
-                        persisted.chunk_index != candidate.chunk_index
+                        persisted.id != candidate.id
+                        or persisted.chunk_index != candidate.chunk_index
                         or persisted.start_offset != candidate.start_offset
                         or persisted.end_offset != candidate.end_offset
                         or persisted.content_sha256 != candidate.content_sha256
+                        or persisted.content != candidate.content
+                        or persisted.page_start != candidate.page_start
+                        or persisted.page_end != candidate.page_end
+                        or persisted.token_count != candidate.token_count
+                        or persisted.profile_revision_id != candidate.profile_revision_id
+                        or persisted.embedding_model_digest != candidate.embedding_model_digest
                     ):
                         raise ChunkWriterConflictError(
                             f"Chunk {candidate.chunk_index} conflicts with persisted chunk"
