@@ -105,16 +105,6 @@ async def _load_session_messages(
     window_msgs = all_msgs[:window]
     window_msgs.reverse()  # oldest-first
 
-    # Token budget enforcement.
-    budget = max_tokens
-    kept: list[ChatMessage] = []
-    for msg in window_msgs:
-        tokens = msg.token_count or len(msg.content.split())
-        if budget - tokens < 0 and kept:
-            break
-        budget -= tokens
-        kept.append(msg)
-
     # Look for a compaction summary message (T8-34: assistant role with new prefix).
     summary_text: str | None = None
     for msg in reversed(all_msgs):
@@ -125,6 +115,26 @@ async def _load_session_messages(
         if msg.role == "system" and msg.content.startswith("[SESSION SUMMARY]"):
             summary_text = msg.content.removeprefix("[SESSION SUMMARY] ").strip()
             break
+
+    # T9-04: Token budget enforcement — summary is counted first.
+    budget = max_tokens
+
+    if summary_text:
+        summary_tokens = len(summary_text.split())
+        if summary_tokens >= budget:
+            # Summary alone exceeds budget — truncate it, no room for messages.
+            words = summary_text.split()
+            summary_text = " ".join(words[:budget])
+            return [], summary_text
+        budget -= summary_tokens
+
+    kept: list[ChatMessage] = []
+    for msg in window_msgs:
+        tokens = msg.token_count or len(msg.content.split())
+        if budget - tokens < 0 and kept:
+            break
+        budget -= tokens
+        kept.append(msg)
 
     return kept, summary_text
 
