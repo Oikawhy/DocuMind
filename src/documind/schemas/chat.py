@@ -61,6 +61,10 @@ class MessageOut(BaseModel):
     content: str
     token_count: int | None = None
     created_at: datetime
+    # T9-08: Optional metadata from AgentRun for assistant messages.
+    citations: list[str] | None = None
+    confidence: str | None = None
+    route: str | None = None
 
 
 class SessionSummary(BaseModel):

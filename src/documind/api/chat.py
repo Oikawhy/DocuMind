@@ -399,7 +399,7 @@ async def post_chat(
             session.add(assistant_msg)
             await session.flush()
 
-            # Record agent run.
+            # Record agent run — T9-08: populate all available fields.
             agent_run = AgentRun(
                 id=uuid.uuid4(),
                 session_id=chat_session.id,
@@ -411,6 +411,40 @@ async def post_chat(
                 },
                 result_message_id=assistant_msg.id,
                 trace_id=trace_id,
+                # T9-08: Persisted RAG metadata fields.
+                confidence=confidence if isinstance(confidence, str) else None,
+                principal_subject=principal.subject,
+                citation_ids=[c.citation_id for c in citations] if citations else None,
+                policy_revisions=(
+                    rag_result.policy_revisions
+                    if rag_service is not None and not abstained and hasattr(rag_result, "policy_revisions")
+                    else None
+                ),
+                model_route_revisions=(
+                    rag_result.model_route_revisions
+                    if rag_service is not None and not abstained and hasattr(rag_result, "model_route_revisions")
+                    else None
+                ),
+                prompt_revisions=(
+                    rag_result.prompt_revisions
+                    if rag_service is not None and not abstained and hasattr(rag_result, "prompt_revisions")
+                    else None
+                ),
+                abstention_reason=(
+                    rag_result.abstention_reason
+                    if rag_service is not None and hasattr(rag_result, "abstention_reason")
+                    else None
+                ),
+                retry_count=(
+                    rag_result.retry_count
+                    if rag_service is not None and not abstained and hasattr(rag_result, "retry_count")
+                    else None
+                ),
+                timing=(
+                    {"total_ms": rag_result.timing_ms}
+                    if rag_service is not None and not abstained and hasattr(rag_result, "timing_ms")
+                    else None
+                ),
             )
             session.add(agent_run)
 
@@ -562,22 +596,46 @@ async def get_session(
             for m in messages:
                 if m.role == "system" and m.content.startswith("[SESSION SUMMARY]"):
                     summary_text = m.content.removeprefix("[SESSION SUMMARY] ").strip()
+                elif m.role == "assistant" and m.content.startswith("[COMPACTION_SUMMARY]"):
+                    summary_text = m.content.removeprefix("[COMPACTION_SUMMARY] ").strip()
 
-        return SessionDetail(
-            id=chat_session.id,
-            created_at=chat_session.created_at,
-            retention_expires_at=chat_session.retention_expires_at,
-            messages=[
+            # T9-08: Load AgentRun metadata for assistant messages.
+            agent_runs_stmt = (
+                select(AgentRun)
+                .where(AgentRun.session_id == session_id)
+            )
+            ar_result = await session.execute(agent_runs_stmt)
+            agent_runs = {
+                ar.result_message_id: ar
+                for ar in ar_result.scalars().all()
+                if ar.result_message_id is not None
+            }
+
+        msg_out_list: list[MessageOut] = []
+        for m in messages:
+            if m.role == "system" and m.content.startswith("[SESSION SUMMARY]"):
+                continue
+            if m.role == "assistant" and m.content.startswith("[COMPACTION_SUMMARY]"):
+                continue
+            ar = agent_runs.get(m.id)
+            msg_out_list.append(
                 MessageOut(
                     id=m.id,
                     role=m.role,
                     content=m.content,
                     token_count=m.token_count,
                     created_at=m.created_at,
+                    citations=ar.citation_ids if ar else None,
+                    confidence=ar.confidence if ar else None,
+                    route=(ar.graph_state_checkpoint or {}).get("route") if ar else None,
                 )
-                for m in messages
-                if not (m.role == "system" and m.content.startswith("[SESSION SUMMARY]"))
-            ],
+            )
+
+        return SessionDetail(
+            id=chat_session.id,
+            created_at=chat_session.created_at,
+            retention_expires_at=chat_session.retention_expires_at,
+            messages=msg_out_list,
             summary=summary_text,
         )
     except DomainError as exc:
