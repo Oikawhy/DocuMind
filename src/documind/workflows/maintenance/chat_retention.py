@@ -24,17 +24,16 @@ async def cleanup_expired_sessions(
     session_factory: async_sessionmaker[AsyncSession],
     audit_service: AuditService | None = None,
     *,
+    held_subjects: frozenset[str] = frozenset(),
     batch_size: int = 100,
 ) -> int:
     """Delete chat sessions past their retention window.
 
     Returns the count of sessions removed.
 
-    Hold/tombstone awareness: sessions referencing subjects with an
-    active legal hold are skipped — the hold check is delegated to the
-    authorization layer before erasure, but here we simply skip sessions
-    that haven't expired yet or whose ``retention_expires_at`` is in the
-    future.
+    T9-07: Sessions owned by subjects listed in ``held_subjects`` are
+    skipped — these subjects own documents under active legal hold and
+    their chat history must be preserved until the hold is released.
     """
     now = datetime.now(UTC)
     deleted_count = 0
@@ -51,6 +50,15 @@ async def cleanup_expired_sessions(
         expired_sessions = list(result.scalars().all())
 
     for expired in expired_sessions:
+        # T9-07: Skip sessions whose subject has an active legal hold.
+        if expired.subject in held_subjects:
+            await logger.ainfo(
+                "chat_retention_skipped_legal_hold",
+                session_id=str(expired.id),
+                subject=expired.subject,
+            )
+            continue
+
         try:
             async with session_factory() as session, session.begin():
                 # Delete agent runs first (FK constraint).

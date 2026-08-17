@@ -64,15 +64,17 @@ async def test_cleanup_processes_expired_sessions() -> None:
     mock_begin.__aenter__ = AsyncMock(return_value=None)
     mock_begin.__aexit__ = AsyncMock(return_value=False)
     mock_db_session.begin = MagicMock(return_value=mock_begin)
+    mock_db_session.delete = AsyncMock()
 
-    # First execute returns sessions list, second is the update, third is reload.
+    # First execute returns sessions list; then delete AgentRun, delete ChatMessage,
+    # and finally reload the session for deletion.
     session_result = MagicMock()
     session_result.scalars.return_value.all.return_value = [expired_session]
 
     reload_result = MagicMock()
     reload_result.scalar_one_or_none.return_value = expired_session
 
-    mock_db_session.execute = AsyncMock(side_effect=[session_result, None, reload_result])
+    mock_db_session.execute = AsyncMock(side_effect=[session_result, None, None, reload_result])
 
     mock_factory = MagicMock(return_value=mock_db_session)
 
