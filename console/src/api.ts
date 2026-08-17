@@ -111,17 +111,68 @@ export class ApiClient {
     return this.request(`/v1/documents/${id}`);
   }
 
+  /**
+   * Upload a document with progress tracking (T9-17).
+   *
+   * Uses XMLHttpRequest instead of fetch to support upload progress events.
+   */
   async uploadDocument(
     file: File,
     title: string,
     declaredType: string,
     idempotencyKey: string,
+    options?: {
+      labels?: string;
+      onProgress?: (percent: number) => void;
+    },
   ): Promise<AdmissionResponse> {
     const form = new FormData();
     form.append("file", file);
     form.append("title", title);
     form.append("declared_type", declaredType);
-    form.append("labels", "");
+    form.append("labels", options?.labels ?? "");
+
+    if (options?.onProgress) {
+      // Use XMLHttpRequest for progress tracking.
+      return new Promise<AdmissionResponse>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/v1/documents");
+
+        // Set auth header.
+        if (this.token) {
+          xhr.setRequestHeader("Authorization", `Bearer ${this.token}`);
+        }
+        xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            options.onProgress!(Math.round((e.loaded / e.total) * 100));
+          }
+        };
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(JSON.parse(xhr.responseText));
+          } else {
+            try {
+              const json = JSON.parse(xhr.responseText);
+              reject(new ApiError(json.error ?? {
+                code: "UNKNOWN",
+                message: xhr.statusText,
+                trace_id: "",
+                details: [],
+              }, xhr.status));
+            } catch {
+              reject(new Error(xhr.statusText || "Upload failed"));
+            }
+          }
+        };
+
+        xhr.onerror = () => reject(new Error("Network error during upload"));
+        xhr.send(form);
+      });
+    }
+
     return this.request("/v1/documents", {
       method: "POST",
       headers: this.headers({ "Idempotency-Key": idempotencyKey }),

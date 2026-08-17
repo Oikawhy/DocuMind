@@ -225,6 +225,22 @@ export function DocumentViewer() {
             </table>
           )}
         </div>
+
+        {/* T9-18: Viewer limitation notice */}
+        <div
+          className="card"
+          style={{
+            borderLeft: "3px solid var(--warning, #f59e0b)",
+            background: "var(--surface-100, #1e1e2e)",
+          }}
+        >
+          <p style={{ fontSize: "0.8125rem", color: "var(--text-muted)", margin: 0 }}>
+            <strong style={{ color: "var(--warning, #f59e0b)" }}>⚠ Viewer Limitation:</strong>{" "}
+            Document content preview is not available in this release. Only metadata
+            and version history are displayed. Full PDF/DOCX rendering with
+            custom font assets will be available in a future update.
+          </p>
+        </div>
       </div>
     </div>
   );
