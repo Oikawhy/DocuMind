@@ -87,9 +87,25 @@ function AuthenticatedShell() {
 }
 
 export default function App() {
-  // If no OIDC authority is configured, render the shell without auth
-  // (development mode / placeholder).
+  // T9-16: If no OIDC authority is configured, handle based on environment.
   if (!oidcConfig.authority) {
+    // In production, missing OIDC authority is a configuration error.
+    if (import.meta.env.PROD) {
+      return (
+        <div className="login-page">
+          <div className="login-card fade-in">
+            <h1>Configuration Error</h1>
+            <p>
+              OIDC authority is not configured. Set{" "}
+              <code>VITE_OIDC_AUTHORITY</code> to your identity provider URL
+              before deploying.
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    // Development mode — render without auth for convenience.
     return (
       <ToastProvider>
         <BrowserRouter>
