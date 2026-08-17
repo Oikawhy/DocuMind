@@ -63,9 +63,13 @@ async def test_register_webhook_returns_201(client: AsyncClient) -> None:
 
     original_identity = app.state.identity_service
     original_webhook = app.state.webhook_service
+    original_auth = getattr(app.state, "authorization_service", None)
+    original_audit = getattr(app.state, "audit_service", None)
     try:
         app.state.identity_service = identity
         app.state.webhook_service = service
+        app.state.authorization_service = None  # Bypass auth for this test
+        app.state.audit_service = None
         response = await client.post(
             "/v1/webhooks",
             json={
@@ -85,6 +89,8 @@ async def test_register_webhook_returns_201(client: AsyncClient) -> None:
     finally:
         app.state.identity_service = original_identity
         app.state.webhook_service = original_webhook
+        app.state.authorization_service = original_auth
+        app.state.audit_service = original_audit
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +106,11 @@ async def test_register_webhook_rejects_ssrf(client: AsyncClient) -> None:
 
     original_identity = app.state.identity_service
     original_webhook = app.state.webhook_service
+    original_auth = getattr(app.state, "authorization_service", None)
     try:
         app.state.identity_service = identity
         app.state.webhook_service = service
+        app.state.authorization_service = None
         response = await client.post(
             "/v1/webhooks",
             json={
@@ -118,6 +126,7 @@ async def test_register_webhook_rejects_ssrf(client: AsyncClient) -> None:
     finally:
         app.state.identity_service = original_identity
         app.state.webhook_service = original_webhook
+        app.state.authorization_service = original_auth
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +212,38 @@ async def test_deactivate_webhook_returns_404_when_missing(client: AsyncClient) 
 async def test_webhooks_require_auth(client: AsyncClient) -> None:
     response = await client.post("/v1/webhooks", json={})
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# T9-15: Authorization gate
+# ---------------------------------------------------------------------------
+
+
+async def test_register_webhook_denied_by_authorization(client: AsyncClient) -> None:
+    """Authorization denial → 403."""
+    identity = _mock_identity()
+    mock_auth = AsyncMock()
+    mock_auth_result = MagicMock()
+    mock_auth_result.allowed = False
+    mock_auth_result.reason = "unauthorized"
+    mock_auth.authorize.return_value = mock_auth_result
+
+    original_identity = app.state.identity_service
+    original_auth = getattr(app.state, "authorization_service", None)
+    try:
+        app.state.identity_service = identity
+        app.state.authorization_service = mock_auth
+
+        response = await client.post(
+            "/v1/webhooks",
+            json={
+                "target_url": "https://example.com/hook",
+                "event_type_glob": "document.*",
+                "secret": "a" * 32,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 403
+    finally:
+        app.state.identity_service = original_identity
+        app.state.authorization_service = original_auth

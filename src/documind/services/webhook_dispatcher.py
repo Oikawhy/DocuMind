@@ -49,8 +49,10 @@ class WebhookDispatcher:
             result = await session.execute(stmt)
             all_webhooks = list(result.scalars().all())
 
+        # T9-13: Match active webhooks whose glob pattern matches this event type.
         matching = [
-            w for w in all_webhooks if event_type in (w.events or [])
+            w for w in all_webhooks
+            if fnmatch.fnmatch(event_type, w.event_type_glob)
         ]
 
         if not matching:

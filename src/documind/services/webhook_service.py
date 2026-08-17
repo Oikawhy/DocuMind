@@ -20,9 +20,11 @@ import httpx
 import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from typing import Any
 
 from documind.domain.errors import SSRFViolationError
 from documind.models.webhook import Webhook, WebhookDelivery
+from documind.services.audit_service import AuditEntry
 
 logger = structlog.get_logger()
 
@@ -46,8 +48,13 @@ class DeliveryResult:
 class WebhookService:
     """SSRF-safe webhook registration and signed delivery."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        audit_service: Any = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._audit_service = audit_service
 
     # ------------------------------------------------------------------
     # SSRF defense
@@ -307,6 +314,30 @@ class WebhookService:
             state=state,
             http_status=http_status,
         )
+
+        # T9-14: Audit evidence for every delivery attempt.
+        if self._audit_service is not None:
+            try:
+                await self._audit_service.write_event(
+                    AuditEntry(
+                        actor_subject=None,
+                        action="webhook.delivery.attempted",
+                        resource_type="webhook_delivery",
+                        resource_id=str(delivery_id),
+                        details={
+                            "webhook_id": str(webhook.id),
+                            "outbox_event_id": str(outbox_event_id),
+                            "attempt": attempt,
+                            "state": state,
+                            "http_status": http_status,
+                        },
+                    )
+                )
+            except Exception:
+                await logger.awarning(
+                    "webhook_delivery_audit_failed",
+                    delivery_id=str(delivery_id),
+                )
 
         return DeliveryResult(
             delivery_id=delivery_id,
