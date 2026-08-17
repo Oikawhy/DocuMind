@@ -457,7 +457,16 @@ async def list_sessions(
     cursor: str | None = None,
     limit: int = 20,
 ) -> CursorPage | JSONResponse:
-    """List caller-owned chat sessions, cursor-paginated."""
+    """List caller-owned chat sessions, cursor-paginated.
+
+    T9-05: Uses opaque ``(created_at, id)`` compound cursor for stable
+    gap-free pagination aligned with ``created_at DESC`` order.
+    """
+    import base64
+    import json
+
+    from sqlalchemy import tuple_
+
     try:
         principal = _principal(request)
         sf = _session_factory(request)
@@ -466,14 +475,19 @@ async def list_sessions(
             stmt = (
                 select(ChatSession)
                 .where(ChatSession.subject == principal.subject)
-                .order_by(ChatSession.created_at.desc())
+                .order_by(ChatSession.created_at.desc(), ChatSession.id.desc())
                 .limit(limit + 1)
             )
             if cursor:
                 try:
-                    cursor_id = uuid.UUID(cursor)
-                    stmt = stmt.where(ChatSession.id < cursor_id)
-                except ValueError:
+                    decoded = json.loads(base64.urlsafe_b64decode(cursor))
+                    cursor_ts = datetime.fromisoformat(decoded["t"])
+                    cursor_id = uuid.UUID(decoded["i"])
+                    stmt = stmt.where(
+                        tuple_(ChatSession.created_at, ChatSession.id)
+                        < tuple_(cursor_ts, cursor_id)
+                    )
+                except (ValueError, KeyError, Exception):
                     pass
 
             result = await session.execute(stmt)
@@ -499,7 +513,16 @@ async def list_sessions(
                     ).model_dump(mode="json")
                 )
 
-            next_cursor = str(sessions[limit].id) if len(sessions) > limit else None
+            next_cursor = None
+            if len(sessions) > limit:
+                last = sessions[limit - 1]
+                cursor_data = {
+                    "t": last.created_at.isoformat(),
+                    "i": str(last.id),
+                }
+                next_cursor = base64.urlsafe_b64encode(
+                    json.dumps(cursor_data).encode()
+                ).decode()
 
         return CursorPage(items=items, next_cursor=next_cursor)
     except DomainError as exc:
