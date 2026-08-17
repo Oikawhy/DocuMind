@@ -8,11 +8,14 @@ change after draft generation.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from documind.rag.state import AgentState, Citation, CitationVerification
+
+if TYPE_CHECKING:
+    from documind.domain.authorization_context import AuthorizationContext
 
 logger = structlog.get_logger(__name__)
 
@@ -20,13 +23,14 @@ logger = structlog.get_logger(__name__)
 async def citation_verifier_node(
     state: AgentState,
     *,
+    auth_context: AuthorizationContext | None = None,
     session_factory: Any | None = None,
-    allowed_document_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Deterministically verify all citations from the draft answer.
 
-    Checks claim coverage and evidence-set membership.  When a database
-    session is available, also checks canonical integrity and tombstones.
+    T8-12: Sets ``abstention_reason`` when citations are invalid.
+    T8-28: Uses ``auth_context.document_ids`` for doc-ID checks,
+    always performs the check (no truthiness guard on empty set).
     """
     draft = state.get("draft_answer")
     if draft is None:
@@ -102,6 +106,10 @@ async def citation_verifier_node(
             for c in verified
         ]
 
+        # T8-28: Always pass document IDs from auth_context.
+        doc_ids = auth_context.document_ids if auth_context else set()
+        sf = auth_context.session_factory if auth_context else session_factory
+
         input_data = VerifyCitationsInput(
             claims=claims_data,
             citations=citations_data,
@@ -110,11 +118,11 @@ async def citation_verifier_node(
         )
 
         try:
-            async with session_factory() as session:
+            async with sf() as session:
                 db_result = await verify_citations(
                     input_data,
                     session=session,
-                    allowed_document_ids=allowed_document_ids,
+                    allowed_document_ids=doc_ids,
                 )
 
             if not db_result.all_valid:
@@ -136,6 +144,33 @@ async def citation_verifier_node(
                                     valid=False,
                                     invalidation_reason=status.reason,
                                 ))
+
+            # T8-27: Populate provenance on verified citations.
+            provenance_by_id = {
+                s.citation_id: s.provenance
+                for s in db_result.statuses
+                if s.valid and s.provenance
+            }
+            enriched: list[Citation] = []
+            for cit in verified:
+                prov = provenance_by_id.get(cit.citation_id, {})
+                if prov:
+                    enriched.append(Citation(
+                        citation_id=cit.citation_id,
+                        claim_id=cit.claim_id,
+                        document_id=prov.get("document_id", cit.document_id),
+                        version_id=prov.get("version_id", cit.version_id),
+                        version_number=prov.get("version_number", cit.version_number),
+                        chunk_id=cit.chunk_id,
+                        page_start=prov.get("page_start", cit.page_start),
+                        page_end=prov.get("page_end", cit.page_end),
+                        section_path=prov.get("section_path", cit.section_path),
+                        content_sha256=prov.get("content_sha256", cit.content_sha256),
+                        valid=True,
+                    ))
+                else:
+                    enriched.append(cit)
+            verified = enriched
         except Exception:
             logger.exception("citation_db_check_error")
 
@@ -146,10 +181,15 @@ async def citation_verifier_node(
         failure_code=failure_code,
     )
 
-    return {
+    # T8-12: Set abstention_reason when citations are invalid.
+    update: dict[str, Any] = {
         "citation_verification": verification,
         "agent_path": [
             *state.get("agent_path", []),
             f"citation_verify:valid={all_valid},verified={len(verified)},invalid={len(invalid)}",
         ],
     }
+    if not all_valid:
+        update["abstention_reason"] = f"Citation verification failed: {failure_code}"
+
+    return update

@@ -115,9 +115,13 @@ async def _load_session_messages(
         budget -= tokens
         kept.append(msg)
 
-    # Look for a system summary message (compaction artifact).
+    # Look for a compaction summary message (T8-34: assistant role with new prefix).
     summary_text: str | None = None
     for msg in reversed(all_msgs):
+        if msg.role == "assistant" and msg.content.startswith("[COMPACTION_SUMMARY]"):
+            summary_text = msg.content.removeprefix("[COMPACTION_SUMMARY] ").strip()
+            break
+        # Backward compatibility with legacy system-role summaries.
         if msg.role == "system" and msg.content.startswith("[SESSION SUMMARY]"):
             summary_text = msg.content.removeprefix("[SESSION SUMMARY] ").strip()
             break
@@ -131,11 +135,12 @@ async def _maybe_compact_session(
     llm_service: Any,
     *,
     threshold: int = 30,
+    token_budget: int = 4096,
 ) -> None:
     """At ``threshold`` messages, summarize older messages outside the window.
 
-    Uses the KEYWORDS role for the compaction LLM call.  The summary is
-    stored as a ``system`` message prefixed with ``[SESSION SUMMARY]``.
+    T8-34: Uses registered SESSION_COMPACTOR_PROMPT + wrap_with_safety().
+    T8-35: Enforces token budget via character-based estimation.
     """
     count_stmt = (
         select(func.count())
@@ -154,8 +159,8 @@ async def _maybe_compact_session(
         .select_from(ChatMessage)
         .where(
             ChatMessage.session_id == session_id,
-            ChatMessage.role == "system",
-            ChatMessage.content.startswith("[SESSION SUMMARY]"),
+            ChatMessage.role == "assistant",
+            ChatMessage.content.startswith("[COMPACTION_SUMMARY]"),
         )
     )
     if existing.scalar_one() > 0:
@@ -174,28 +179,62 @@ async def _maybe_compact_session(
     if not old_msgs:
         return
 
-    # Build summarization text.
-    conversation = "\n".join(f"{m.role}: {m.content[:500]}" for m in old_msgs)
+    # T8-35: Truncate from oldest until conversation fits token budget.
+    # ~4 chars per token is a conservative estimate.
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(text) // 4)
+
+    conversation_parts: list[str] = []
+    token_count = 0
+    for m in old_msgs:
+        part = f"{m.role}: {m.content[:500]}"
+        part_tokens = _estimate_tokens(part)
+        if token_count + part_tokens > token_budget:
+            break
+        conversation_parts.append(part)
+        token_count += part_tokens
+
+    conversation = "\n".join(conversation_parts)
 
     if llm_service is not None:
         try:
+            # T8-34: Use registered template + safety wrapper.
+            from documind.rag.prompts.safety import wrap_with_safety
+
+            try:
+                from documind.rag.prompts.registry import build_default_registry
+                registry = build_default_registry()
+                template = registry.resolve("session_compactor")
+                system_prompt = wrap_with_safety(template.text)
+            except (KeyError, ImportError):
+                system_prompt = wrap_with_safety(
+                    "Summarize this conversation history concisely. Focus on key topics, "
+                    "decisions, and context that would help continue the conversation."
+                )
+
             summary = await llm_service.complete(
                 role="KEYWORDS",
-                system_prompt="Summarize this conversation history concisely. Focus on key topics, decisions, and context that would help continue the conversation.",
+                system_prompt=system_prompt,
                 user_prompt=conversation[:4000],
             )
+
+            # T8-35: Ensure summary doesn't exceed remaining budget.
+            summary_tokens = _estimate_tokens(summary)
+            if summary_tokens > token_budget:
+                summary = summary[:token_budget * 4]
         except Exception:
             await logger.awarning("session_compaction_llm_failed", session_id=str(session_id))
             summary = f"Conversation with {len(old_msgs)} earlier messages."
     else:
         summary = f"Conversation with {len(old_msgs)} earlier messages."
 
+    # T8-34: Use role="assistant" with metadata flag instead of "system".
     summary_msg = ChatMessage(
         id=uuid.uuid4(),
         session_id=session_id,
-        role="system",
-        content=f"[SESSION SUMMARY] {summary}",
-        token_count=len(summary.split()),
+        role="assistant",
+        content=f"[COMPACTION_SUMMARY] {summary}",
+        token_count=_estimate_tokens(summary),
     )
     session.add(summary_msg)
 
@@ -286,31 +325,48 @@ async def post_chat(
 
             if rag_service is not None:
                 try:
-                    rag_result = await rag_service.run_rag_query(
-                        query=body.message,
+                    # T8-01: Build AuthorizationContext from request state.
+                    from documind.domain.authorization_context import AuthorizationContext
+
+                    auth_svc = getattr(request.app.state, "authorization_service", None)
+                    auth_ctx = AuthorizationContext(
                         principal=principal,
-                        document_ids=body.document_ids,
-                        mode=body.mode,
-                        locale=body.locale,
-                        session_history=history,
-                        session_summary=summary,
+                        authorization_service=auth_svc,
+                        session_factory=sf,
+                        document_ids=frozenset(
+                            str(d) for d in (body.document_ids or [])
+                        ),
                     )
-                    answer = rag_result.get("answer", "")
-                    abstained = rag_result.get("abstained", False)
-                    confidence = rag_result.get("confidence")
-                    route = rag_result.get("route")
-                    agent_path = rag_result.get("agent_path", [])
-                    policy_revisions = rag_result.get("policy_revisions", [])
-                    raw_citations = rag_result.get("citations", [])
+
+                    rag_result = await rag_service.run_rag_query(
+                        question=body.message,
+                        auth_context=auth_ctx,
+                        session_id=str(body.session_id) if body.session_id else None,
+                        session_summary=summary,
+                        chat_history=[
+                            {"role": m.role, "content": m.content} for m in history
+                        ],
+                        locale=getattr(body, "locale", "en") or "en",
+                        trace_id=str(trace_id),
+                    )
+
+                    # T8-02: Access RAGResponse as dataclass attributes, not dict.
+                    answer = rag_result.answer or ""
+                    abstained = rag_result.abstained
+                    confidence = rag_result.confidence
+                    route = rag_result.route
+                    agent_path = rag_result.agent_path
+                    policy_revisions = list(rag_result.policy_revisions.keys()) if rag_result.policy_revisions else []
+                    raw_citations = rag_result.citations
                     citations = [
                         CitationOut(
-                            citation_id=c.get("citation_id", ""),
-                            document_id=c["document_id"],
-                            version_id=c["version_id"],
-                            version_number=c.get("version_number", 0),
-                            chunk_id=c["chunk_id"],
-                            excerpt=c.get("excerpt", ""),
-                            content_sha256=c.get("content_sha256", ""),
+                            citation_id=c.get("citation_id", "") if isinstance(c, dict) else getattr(c, "citation_id", ""),
+                            document_id=c.get("document_id", "") if isinstance(c, dict) else getattr(c, "document_id", ""),
+                            version_id=c.get("version_id", "") if isinstance(c, dict) else getattr(c, "version_id", ""),
+                            version_number=c.get("version_number", 0) if isinstance(c, dict) else getattr(c, "version_number", 0),
+                            chunk_id=c.get("chunk_id", "") if isinstance(c, dict) else getattr(c, "chunk_id", ""),
+                            excerpt=c.get("excerpt", "") if isinstance(c, dict) else getattr(c, "excerpt", ""),
+                            content_sha256=c.get("content_sha256", "") if isinstance(c, dict) else getattr(c, "content_sha256", ""),
                         )
                         for c in raw_citations
                     ]

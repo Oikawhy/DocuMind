@@ -88,7 +88,7 @@ async def retrieve_evidence(
         )
 
         try:
-            response = await retrieval_service.search(
+            response = await retrieval_service.retrieve(
                 request=request,
                 principal=principal,
             )

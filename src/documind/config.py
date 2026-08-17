@@ -55,10 +55,16 @@ class Settings(BaseSettings):
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_auth_ref: str = ""
+    neo4j_max_hops_local: int = 2  # T7-10: max 2 hops enforced
+    neo4j_max_sources_global: int = 100
 
     # Embedding model
     embedding_model_path: str = "/opt/documind/models/bge-m3"
     embedding_model_digest: str = ""
+
+    # Reranker sidecar
+    reranker_sidecar_url: str = "http://reranker:8501"
+    reranker_timeout_ms: int = 1000
 
     # Temporal
     temporal_host: str = "localhost:7233"
@@ -90,6 +96,8 @@ class Settings(BaseSettings):
     retrieval_reranker_threshold: float = 0.10
     retrieval_rrf_constant: int = 60
     retrieval_budget_ms: int = 2500
+    retrieval_enabled_modes: str = "naive,local,global,hybrid"
+    retrieval_default_mode: str = "hybrid"
 
     # Chat memory (§7.1)
     chat_enabled: bool = False

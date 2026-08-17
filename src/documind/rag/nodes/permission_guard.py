@@ -1,17 +1,21 @@
 """Permission Guard node per §7.4 — deterministic canonical recheck.
 
 Distinct from the Task 7 ``PermissionGuard`` helper — this is the
-graph node that receives candidate IDs, rereads canonical metadata
-from PostgreSQL, and returns allowed evidence IDs with audit.
+graph node that receives candidate IDs, delegates to the full
+``AuthorizationService`` via ``AuthorizationContext``, and returns
+allowed evidence IDs with audit.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from documind.rag.state import AgentState
+
+if TYPE_CHECKING:
+    from documind.domain.authorization_context import AuthorizationContext
 
 logger = structlog.get_logger(__name__)
 
@@ -19,11 +23,15 @@ logger = structlog.get_logger(__name__)
 async def permission_guard_node(
     state: AgentState,
     *,
-    session_factory: Any,
-    allowed_document_ids: set[str],
+    auth_context: AuthorizationContext | None = None,
+    session_factory: Any = None,
     audit_service: Any | None = None,
 ) -> dict[str, Any]:
-    """Canonical PostgreSQL recheck on every candidate.
+    """Canonical authorization recheck on every candidate.
+
+    Uses ``AuthorizationContext`` for full §4.2 authorization decisions
+    (principal, labels, lifecycle, holds, tombstones, policy) instead of
+    static document-ID set checks.
 
     Never places inaccessible titles, excerpts, IDs, or labels in AgentState.
     """
@@ -43,11 +51,13 @@ async def permission_guard_node(
         principal_subject=state["principal_subject"],
     )
 
-    async with session_factory() as session:
+    # T8-06: Use AuthorizationContext for live auth checks.
+    sf = auth_context.session_factory if auth_context else session_factory
+    async with sf() as session:
         result = await permission_guard(
             input_data,
             session,
-            allowed_document_ids,
+            auth_context=auth_context,
             audit_service=audit_service,
             trace_id=state.get("trace_id"),
         )

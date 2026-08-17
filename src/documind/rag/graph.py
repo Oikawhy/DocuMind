@@ -18,7 +18,6 @@ def build_graph(
     retrieval_service: Any,
     reranker_service: Any,
     session_factory: Any,
-    allowed_document_ids: set[str] | None = None,
     audit_service: Any | None = None,
     prompt_registry: Any | None = None,
     template_loader: Any | None = None,
@@ -27,9 +26,13 @@ def build_graph(
 
     Returns a compiled ``StateGraph`` ready for invocation.
 
+    The graph is stateless — per-request data (``AuthorizationContext``,
+    ``EvidenceCache``, document IDs) is threaded through ``AgentState``,
+    not captured in closures.
+
     Conditional edges per §7 Mermaid:
     - Router → {Rewrite, Planner, Abstain}
-    - Grade → {Rewrite (max 3 retrieval), Planner (max 2 expansion), Generate}
+    - Grade → {QueryRewriter (max 3 retrieval), Planner (max 2 expansion), Generate}
     - Hallucination → {Generate (max 2 revision), Verify}
     - Verify → {Format, Abstain}
     """
@@ -50,11 +53,9 @@ def build_graph(
     from documind.rag.nodes.version_resolver import version_resolver_node
     from documind.rag.state import EvidenceCache
 
-    # Create a shared evidence cache per graph invocation.
-    evidence_cache = EvidenceCache()
-    allowed_docs = allowed_document_ids or set()
-
     # -- Node wrapper functions (bind dependencies via closures) --
+    # NOTE: auth_context, evidence_cache, and document_ids are read from
+    # state per-request, not captured at compile time.
 
     async def _router(state: AgentState) -> dict[str, Any]:
         return await router_node(
@@ -71,72 +72,90 @@ def build_graph(
             state, llm_service=llm_service, prompt_registry=prompt_registry,
         )
 
+    # T8-04: Read principal from state["auth_context"] instead of passing None.
     async def _retrieval(state: AgentState) -> dict[str, Any]:
+        auth_ctx = state.get("auth_context")
+        principal = auth_ctx.principal if auth_ctx else None
         return await retrieval_orchestrator_node(
-            state, retrieval_service=retrieval_service, principal=None,
+            state, retrieval_service=retrieval_service, principal=principal,
         )
 
+    # T8-05/T8-06: Read auth_context from state for live authorization.
     async def _permission_guard(state: AgentState) -> dict[str, Any]:
+        auth_ctx = state.get("auth_context")
         return await permission_guard_node(
-            state, session_factory=session_factory,
-            allowed_document_ids=allowed_docs, audit_service=audit_service,
+            state,
+            auth_context=auth_ctx,
+            session_factory=session_factory,
+            audit_service=audit_service,
         )
 
     async def _reranker(state: AgentState) -> dict[str, Any]:
         return await reranker_node(
             state, reranker_service=reranker_service,
-            evidence_cache=evidence_cache, session_factory=session_factory,
+            evidence_cache=state.get("evidence_cache"),
+            session_factory=session_factory,
         )
 
     async def _relevance_grader(state: AgentState) -> dict[str, Any]:
         return await relevance_grader_node(
             state, llm_service=llm_service,
-            evidence_cache=evidence_cache, prompt_registry=prompt_registry,
+            evidence_cache=state.get("evidence_cache"),
+            prompt_registry=prompt_registry,
         )
 
     async def _version_resolver(state: AgentState) -> dict[str, Any]:
+        auth_ctx = state.get("auth_context")
+        doc_ids = auth_ctx.document_ids if auth_ctx else set()
         return await version_resolver_node(
-            state, session_factory=session_factory, allowed_document_ids=allowed_docs,
+            state, session_factory=session_factory,
+            allowed_document_ids=doc_ids,
         )
 
     async def _extractor(state: AgentState) -> dict[str, Any]:
         return await extractor_node(
-            state, llm_service=llm_service, evidence_cache=evidence_cache,
+            state, llm_service=llm_service,
+            evidence_cache=state.get("evidence_cache"),
             template_loader=template_loader, prompt_registry=prompt_registry,
         )
 
     async def _comparator(state: AgentState) -> dict[str, Any]:
         return await comparator_node(
             state, llm_service=llm_service,
-            evidence_cache=evidence_cache, prompt_registry=prompt_registry,
+            evidence_cache=state.get("evidence_cache"),
+            prompt_registry=prompt_registry,
         )
 
     async def _aggregator(state: AgentState) -> dict[str, Any]:
-        return await aggregator_node(state, evidence_cache=evidence_cache)
+        return await aggregator_node(
+            state, evidence_cache=state.get("evidence_cache"),
+        )
 
     async def _generator(state: AgentState) -> dict[str, Any]:
         return await generator_node(
             state, llm_service=llm_service,
-            evidence_cache=evidence_cache, prompt_registry=prompt_registry,
+            evidence_cache=state.get("evidence_cache"),
+            prompt_registry=prompt_registry,
         )
 
     async def _hallucination_grader(state: AgentState) -> dict[str, Any]:
         return await hallucination_grader_node(
             state, llm_service=llm_service,
-            evidence_cache=evidence_cache, prompt_registry=prompt_registry,
+            evidence_cache=state.get("evidence_cache"),
+            prompt_registry=prompt_registry,
         )
 
+    # T8-28: Read auth_context from state for citation doc-ID check.
     async def _citation_verifier(state: AgentState) -> dict[str, Any]:
+        auth_ctx = state.get("auth_context")
         return await citation_verifier_node(
-            state, session_factory=session_factory,
-            allowed_document_ids=allowed_docs,
+            state,
+            auth_context=auth_ctx,
+            session_factory=session_factory,
         )
 
     async def _response_formatter(state: AgentState) -> dict[str, Any]:
-        result = await response_formatter_node(state)
-        # Expire evidence cache at graph completion.
-        evidence_cache.expire_all()
-        return result
+        return await response_formatter_node(state)
 
     # -- Build the graph --
 
@@ -188,13 +207,17 @@ def build_graph(
     graph.add_edge("permission_guard", "reranker")
     graph.add_edge("reranker", "relevance_grader")
 
-    # Conditional edge: Relevance Grader → {retrieval (rewrite), extractor/comparator/aggregator/generator}
+    # T8-09: Conditional edge: Relevance Grader →
+    #   rewrite → query_rewriter (was: retrieval — skipped rewrite)
+    #   targeted_expansion → planner (was: retrieval — skipped plan)
+    #   abstain → response_formatter
+    #   answer → {extractor, comparator, aggregator, generator}
     def route_after_grader(state: AgentState) -> str:
         kind = state.get("relevance_request_kind", "abstain")
         if kind == "rewrite":
-            return "retrieval"
+            return "query_rewriter"
         if kind == "targeted_expansion":
-            return "retrieval"
+            return "planner"
         if kind == "abstain":
             return "response_formatter"
         # "answer" — proceed to analysis/generation based on route type.
@@ -208,7 +231,8 @@ def build_graph(
         return "generator"
 
     graph.add_conditional_edges("relevance_grader", route_after_grader, {
-        "retrieval": "retrieval",
+        "query_rewriter": "query_rewriter",
+        "planner": "planner",
         "response_formatter": "response_formatter",
         "extractor": "extractor",
         "comparator": "comparator",
@@ -216,21 +240,36 @@ def build_graph(
         "generator": "generator",
     })
 
-    # Analysis nodes → Generator
-    graph.add_edge("extractor", "generator")
+    # T8-16: Extractor routes conditionally —
+    #   comparison route → comparator (schema-aware extraction before comparison)
+    #   otherwise → generator
+    def route_after_extractor(state: AgentState) -> str:
+        if state.get("route_type") == "comparison":
+            return "comparator"
+        return "generator"
+
+    graph.add_conditional_edges("extractor", route_after_extractor, {
+        "comparator": "comparator",
+        "generator": "generator",
+    })
+
+    # Comparator / Aggregator → Generator
     graph.add_edge("comparator", "generator")
     graph.add_edge("aggregator", "generator")
 
     # Generator → Hallucination Grader
     graph.add_edge("generator", "hallucination_grader")
 
-    # Conditional edge: Hallucination Grader → {generator (revision needed), citation_verifier}
+    # T8-11: Conditional edge: Hallucination Grader →
+    #   revision needed AND under cap → generator
+    #   otherwise → citation_verifier or response_formatter (abstention)
+    #   Fixed: use strict < instead of <= to prevent off-by-one
     def route_after_hallucination(state: AgentState) -> str:
         grade = state.get("hallucination_grade")
         if grade is not None and grade.needs_revision:
             revisions = state.get("generation_revisions", 0)
             from documind.rag.state import MAX_GENERATION_REVISIONS
-            if revisions <= MAX_GENERATION_REVISIONS:
+            if revisions < MAX_GENERATION_REVISIONS:
                 return "generator"
         # Check for abstention.
         if state.get("abstention_reason"):
@@ -243,12 +282,10 @@ def build_graph(
         "response_formatter": "response_formatter",
     })
 
-    # Conditional edge: Citation Verifier → {response_formatter (all valid or abstain)}
+    # Conditional edge: Citation Verifier → response_formatter
+    # T8-12: The citation_verifier_node now sets abstention_reason when
+    # all_valid is False, so the formatter will produce an abstention.
     def route_after_citation(state: AgentState) -> str:
-        verification = state.get("citation_verification")
-        if verification is not None and not verification.all_valid:
-            # Citation invalid — check if this warrants abstention.
-            return "response_formatter"
         return "response_formatter"
 
     graph.add_conditional_edges("citation_verifier", route_after_citation, {

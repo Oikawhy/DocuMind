@@ -205,6 +205,10 @@ class AgentState(TypedDict, total=False):
     # --- Request / trace / principal identifiers ---
     request_id: str
     trace_id: str
+    # AuthorizationContext is typed as Any because LangGraph evaluates
+    # type hints at runtime via get_type_hints(); a forward reference
+    # would cause NameError at graph compilation.
+    auth_context: Any  # AuthorizationContext | None
     principal_subject: str
     authorization_revision: int
     retrieval_policy_revision: int
@@ -262,6 +266,7 @@ class AgentState(TypedDict, total=False):
     relevance_request_kind: Literal["answer", "rewrite", "targeted_expansion", "abstain"] | None
 
     # --- Runtime metadata ---
+    evidence_cache: Any  # EvidenceCache, per-request (T8-07)
     start_time: float  # monotonic clock start for budget enforcement
 
 
@@ -269,6 +274,8 @@ def create_initial_state(
     *,
     question: str,
     principal_subject: str,
+    auth_context: Any | None = None,
+    evidence_cache: Any | None = None,
     trace_id: str | None = None,
     request_id: str | None = None,
     session_id: str | None = None,
@@ -285,6 +292,7 @@ def create_initial_state(
     return AgentState(
         request_id=request_id or str(uuid.uuid4()),
         trace_id=trace_id or str(uuid.uuid4()),
+        auth_context=auth_context,
         principal_subject=principal_subject,
         authorization_revision=authorization_revision,
         retrieval_policy_revision=retrieval_policy_revision,
@@ -320,6 +328,7 @@ def create_initial_state(
         final_response=None,
         agent_path=[],
         relevance_request_kind=None,
+        evidence_cache=evidence_cache,
         start_time=time.monotonic(),
     )
 

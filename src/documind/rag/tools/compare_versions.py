@@ -56,25 +56,29 @@ class CompareVersionsOutput(BaseModel):
 async def compare_versions(
     input_data: CompareVersionsInput,
     evidence_cache: Any,
+    evidence_metadata: dict[str, str] | None = None,
 ) -> CompareVersionsOutput:
     """Produce deterministic diffs between two authorized version evidence sets.
 
-    Compares content from the evidence cache for the left and right versions.
+    T8-20: Partitions evidence by ``version_id`` provenance metadata
+    instead of list position.
     """
     left_content: dict[str, str] = {}
     right_content: dict[str, str] = {}
+    meta = evidence_metadata or {}
 
-    # Partition evidence by version.
     for eid in input_data.evidence_ids:
         content = evidence_cache.get(eid) if evidence_cache else None
         if content is None:
             continue
-        # In practice, evidence would carry version metadata.
-        # For the tool, we split based on position: first half left, second half right.
-        # The actual version assignment happens in the node layer with full metadata.
-        if eid in input_data.evidence_ids[: len(input_data.evidence_ids) // 2]:
+        # T8-20: Use version_id metadata for provenance-based partitioning.
+        version_id = meta.get(eid, "")
+        if version_id == input_data.left_version_id:
             left_content[eid] = content
+        elif version_id == input_data.right_version_id:
+            right_content[eid] = content
         else:
+            # Unknown provenance — assign to right by default.
             right_content[eid] = content
 
     # Build structured diffs.

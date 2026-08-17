@@ -75,7 +75,13 @@ class OpenSearchRetrievalBackend:
                         {"terms": {"version_id": version_id_strs}},
                         {"term": {"lifecycle": "completed"}},
                         {"term": {"tombstone_generation": 0}},
-                    ],
+                    ]
+                    # T7-04: Enforce allowed-label constraint
+                    + (
+                        [{"terms": {"label_ids": [str(lid) for lid in context.allowed_label_ids]}}]
+                        if context.allowed_label_ids
+                        else []
+                    ),
                 }
             },
             "_source": [
@@ -114,12 +120,20 @@ class OpenSearchRetrievalBackend:
         for hit in hits:
             source = hit.get("_source", {})
             try:
+                content_sha256 = str(
+                    source.get("content_sha256")
+                    or source.get("content_hash", "")
+                )
+                chunk_id_str = str(
+                    source.get("chunk_id")
+                    or hit.get("_id", "")
+                )
                 chunk = ScoredChunk(
-                    chunk_id=uuid.UUID(str(source["chunk_id"])),
+                    chunk_id=uuid.UUID(chunk_id_str),
                     version_id=uuid.UUID(str(source["version_id"])),
                     document_id=uuid.UUID(str(source["document_id"])),
                     content=str(source.get("content", "")),
-                    content_sha256=str(source.get("content_sha256", "")),
+                    content_sha256=content_sha256,
                     page_start=source.get("page_start"),
                     page_end=source.get("page_end"),
                     section_path=source.get("section_path", []),

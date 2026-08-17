@@ -270,6 +270,31 @@ services:
       vllm:
         condition: service_started
 
+  # T7-22: BGE reranker sidecar (digest-pinned via build arg)
+  reranker:
+    <<: *service-hardening
+    build:
+      context: .
+      dockerfile: Dockerfile.reranker
+      args:
+        RERANKER_MODEL_DIGEST: ${RERANKER_MODEL_DIGEST:-}
+    user: "10001:10001"
+    networks: [models]
+    read_only: true
+    tmpfs: [/tmp]
+    expose:
+      - "8501"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
   vllm:
     <<: *service-hardening
     image: ${DOCUMIND_IMAGE_VLLM:?Set DOCUMIND_IMAGE_VLLM to a digest-pinned image reference}

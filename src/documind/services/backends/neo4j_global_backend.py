@@ -39,7 +39,7 @@ class Neo4jGlobalRetrievalBackend:
         self._driver = driver
         self._database = database
         self._max_sources = max_sources
-        self._max_path_length = max_path_length
+        self._max_path_length = min(max_path_length, 2)  # T7-10: enforce two-hop maximum
         self._generation_manager = generation_manager
 
     @property
@@ -76,33 +76,62 @@ class Neo4jGlobalRetrievalBackend:
 
             # Global traversal: find facts connected through entity
             # relationships, traverse paths up to max_path_length,
-            # and collect source chunks
-            cypher = """
+            # and collect source chunks.
+            # Relationship directions match the graph_service writer:
+            #   (:Entity)-[:ABOUT]->(:Fact)
+            #   (:Fact)-[:MENTIONS]->(:Entity)
+            #   (:Fact)-[:SOURCED_FROM]->(:Chunk)
+            hop1 = """
             UNWIND $keywords AS keyword
             MATCH (e:Entity)
             WHERE toLower(e.normalized_key) CONTAINS toLower(keyword)
-            MATCH path = (e)<-[:ABOUT|MENTIONS|RELATES_TO*1..{max_path}]-(f:Fact {{generation: $generation}})
+            MATCH (e)-[:ABOUT]->(f:Fact {generation: $generation})
             WHERE f.tombstone_generation = 0
             MATCH (f)-[:SOURCED_FROM]->(c:Chunk)
             WHERE c.version_id IN $allowed_versions
-            WITH DISTINCT c, f, path,
-                 1.0 / (1.0 + length(path)) AS relevance_score
-            RETURN
+            RETURN DISTINCT
                 c.chunk_id AS chunk_id,
                 c.version_id AS version_id,
                 c.document_id AS document_id,
-                c.content AS content,
                 c.content_sha256 AS content_sha256,
                 c.page_start AS page_start,
                 c.page_end AS page_end,
                 c.section_path AS section_path,
                 f.fact_id AS fact_id,
                 f.generation AS generation,
-                length(path) AS hop_count,
-                relevance_score AS score
+                1 AS hop_count,
+                1.0 / 2.0 AS score
+            """
+            hop2 = """
+            UNION
+            UNWIND $keywords AS keyword
+            MATCH (e:Entity)
+            WHERE toLower(e.normalized_key) CONTAINS toLower(keyword)
+            MATCH (e)-[:ABOUT]->(f1:Fact {generation: $generation})
+            WHERE f1.tombstone_generation = 0
+            MATCH (f1)-[:MENTIONS]->(e2:Entity)-[:ABOUT]->(f2:Fact {generation: $generation})
+            WHERE f2.tombstone_generation = 0
+            MATCH (f2)-[:SOURCED_FROM]->(c:Chunk)
+            WHERE c.version_id IN $allowed_versions
+            RETURN DISTINCT
+                c.chunk_id AS chunk_id,
+                c.version_id AS version_id,
+                c.document_id AS document_id,
+                c.content_sha256 AS content_sha256,
+                c.page_start AS page_start,
+                c.page_end AS page_end,
+                c.section_path AS section_path,
+                f2.fact_id AS fact_id,
+                f2.generation AS generation,
+                2 AS hop_count,
+                1.0 / 3.0 AS score
+            """
+            suffix = """
             ORDER BY score DESC
             LIMIT $limit
-            """.replace("{max_path}", str(self._max_path_length))
+            """
+            cypher = hop1 + (hop2 if self._max_path_length >= 2 else "") + suffix
+
 
             async with self._driver.session(database=self._database) as session:
                 result = await session.run(
@@ -187,6 +216,10 @@ class Neo4jGlobalRetrievalBackend:
                     continue
                 seen_chunk_ids.add(chunk_id_str)
 
+                # T7-13: Collect graph provenance
+                fact_id = record.get("fact_id")
+                fact_ids = [str(fact_id)] if fact_id else []
+
                 chunks.append(
                     ScoredChunk(
                         chunk_id=uuid.UUID(chunk_id_str),
@@ -199,6 +232,9 @@ class Neo4jGlobalRetrievalBackend:
                         section_path=record.get("section_path", []),
                         score=float(record.get("score", 0.0)),
                         source_branch="neo4j_global",
+                        fact_ids=fact_ids,
+                        generation=record.get("generation"),
+                        hop_count=record.get("hop_count"),
                     )
                 )
             except (KeyError, ValueError, TypeError) as exc:
@@ -207,3 +243,4 @@ class Neo4jGlobalRetrievalBackend:
                     error=str(exc),
                 )
         return chunks
+

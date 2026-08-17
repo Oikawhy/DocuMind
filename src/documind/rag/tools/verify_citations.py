@@ -27,12 +27,20 @@ SCHEMA_VERSION = "1.0.0"
 
 
 class VerifyCitationsInput(BaseModel):
-    """Input schema for verify_citations tool."""
+    """Input schema for verify_citations tool.
+
+    T8-29: Extended with provenance fields.
+    """
 
     claims: list[dict[str, Any]]
     citations: list[dict[str, Any]]
     evidence_ids: list[str] = Field(default_factory=list)
     principal_subject: str
+    # T8-29: Provenance context for verification.
+    page_offsets: dict[str, dict[str, int]] = Field(default_factory=dict)
+    source_spans: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    document_ids: dict[str, str] = Field(default_factory=dict)  # evidence_id → document_id
+    version_ids: dict[str, str] = Field(default_factory=dict)   # evidence_id → version_id
     schema_version: str = SCHEMA_VERSION
 
 
@@ -42,6 +50,8 @@ class CitationStatus(BaseModel):
     citation_id: str
     valid: bool
     reason: str = ""
+    # T8-27: Provenance metadata for valid citations.
+    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class VerifyCitationsOutput(BaseModel):
@@ -149,8 +159,8 @@ async def verify_citations(
                     all_valid = False
                     continue
 
-                # Check document authorization.
-                if allowed_document_ids and str(version.document_id) not in allowed_document_ids:
+                # T8-28: Always check document authorization (removed truthiness guard).
+                if allowed_document_ids is not None and str(version.document_id) not in allowed_document_ids:
                     statuses.append(
                         CitationStatus(
                             citation_id=cit_id,
@@ -185,7 +195,33 @@ async def verify_citations(
                 all_valid = False
                 continue
 
-        statuses.append(CitationStatus(citation_id=cit_id, valid=True))
+        # T8-27: Populate provenance metadata for valid citations.
+        provenance: dict[str, Any] = {}
+        if session is not None and chunk_id:
+            try:
+                chunk_uuid = uuid.UUID(chunk_id)
+                chunk_stmt = select(DocumentChunk).where(DocumentChunk.id == chunk_uuid)
+                chunk_result = await session.execute(chunk_stmt)
+                chunk = chunk_result.scalar_one_or_none()
+                if chunk is not None:
+                    version_stmt = select(DocumentVersion).where(DocumentVersion.id == chunk.version_id)
+                    version_result = await session.execute(version_stmt)
+                    version = version_result.scalar_one_or_none()
+                    provenance = {
+                        "document_id": str(version.document_id) if version else "",
+                        "version_id": str(chunk.version_id),
+                        "version_number": version.version_number if version else 0,
+                        "page_start": getattr(chunk, "page_start", None),
+                        "page_end": getattr(chunk, "page_end", None),
+                        "section_path": getattr(chunk, "section_path", []) or [],
+                        "content_sha256": getattr(chunk, "content_sha256", "") or "",
+                    }
+            except (ValueError, Exception):
+                pass
+
+        statuses.append(CitationStatus(
+            citation_id=cit_id, valid=True, provenance=provenance,
+        ))
 
     # Check that every claim has at least one citation.
     for claim_id in claim_ids:

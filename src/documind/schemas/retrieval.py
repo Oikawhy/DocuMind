@@ -83,6 +83,10 @@ class ScoredChunk(BaseModel):
     section_path: list[str] = Field(default_factory=list)
     score: float
     source_branch: str
+    # T7-13: Graph provenance
+    fact_ids: list[str] = Field(default_factory=list)
+    generation: int | None = None
+    hop_count: int | None = None
 
 
 class EvidenceItem(BaseModel):
@@ -105,6 +109,11 @@ class RetrievalMetadata(BaseModel):
     evidence_count: int
     elapsed_ms: int
     backend_timings: dict[str, int] = Field(default_factory=dict)
+    # T7-16: Additional metrics preserved in degraded responses
+    fusion_time_ms: int | None = None
+    permission_filter_count: int | None = None
+    reranker_above_threshold: int | None = None
+    reranker_below_threshold: int | None = None
 
 
 class RetrievalResponse(BaseModel):
@@ -122,3 +131,9 @@ class ComparisonResponse(BaseModel):
     resolved_versions: dict[str, str]
     citations: list[Citation] = Field(default_factory=list)
     trace_id: uuid.UUID
+    # T7-18: Deterministic diff data
+    deterministic_diff: dict[str, int] | None = None
+    # T7-19: Evidence requirement errors
+    evidence_errors: list[str] | None = None
+    # T7-20: Resolution errors
+    resolution_errors: list[str] | None = None

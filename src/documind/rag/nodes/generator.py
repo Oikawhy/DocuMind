@@ -3,11 +3,12 @@
 Receives authorized evidence and analysis results.  Produces answer text
 with explicit claim IDs and claim-to-evidence references.  Excludes
 uncited titles, invented sources, and tool calls.
+
+T8-14: Parse failures produce abstention, not synthetic blanket-cited claims.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import structlog
@@ -118,25 +119,24 @@ async def generator_node(
     }
 
     try:
-        result = await llm_service.invoke(
-            ModelRole.QUERY, messages, json_schema=output_schema,
+        from documind.rag.invoke_helpers import invoke_with_retry
+
+        parsed, limitation_code = await invoke_with_retry(
+            llm_service, ModelRole.QUERY, messages,
+            output_schema=output_schema,
+            template_name="generator",
         )
 
-        if result.structured and result.structured.valid:
-            parsed = result.structured.parsed
-        else:
-            try:
-                parsed = json.loads(result.content)
-            except (json.JSONDecodeError, TypeError):
-                # Use raw content as a single-claim answer.
-                parsed = {
-                    "answer": result.content[:2000],
-                    "claims": [{
-                        "claim_id": "gen_claim_0",
-                        "text": result.content[:2000],
-                        "evidence_ids": reranked_ids,
-                    }],
-                }
+        # T8-14: Fail-closed on parse failure — no synthetic claims.
+        if parsed is None:
+            return {
+                "draft_answer": None,
+                "abstention_reason": f"Generator output invalid ({limitation_code})",
+                "agent_path": [
+                    *state.get("agent_path", []),
+                    f"generator:parse_error_abstain:{limitation_code}",
+                ],
+            }
 
         answer_text = parsed.get("answer", "")
         raw_claims = parsed.get("claims", [])

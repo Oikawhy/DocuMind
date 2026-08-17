@@ -43,13 +43,17 @@ async def aggregator_node(
     reranked_ids = state.get("reranked_evidence_ids", [])
     values: list[AggregateValueEntry] = []
 
-    for eid in reranked_ids:
-        content = evidence_cache.get(eid)
-        if content:
-            # Simple numeric extraction — in production this would use
-            # structured extraction results.
-            extracted = _extract_numeric_values(content, eid)
-            values.extend(extracted)
+    # T8-22: Prefer structured extraction results over regex.
+    extraction_results = state.get("extraction_results", [])
+    if extraction_results:
+        values = _values_from_extractions(extraction_results, reranked_ids)
+    else:
+        # Fallback: extract from raw evidence text.
+        for eid in reranked_ids:
+            content = evidence_cache.get(eid)
+            if content:
+                extracted = _extract_numeric_values(content, eid)
+                values.extend(extracted)
 
     if not values:
         return {
@@ -157,4 +161,51 @@ def _extract_numeric_values(content: str, evidence_id: str) -> list:
             )
         )
 
+    return entries
+
+
+def _values_from_extractions(
+    extraction_results: list[Any],
+    evidence_ids: list[str],
+) -> list[Any]:
+    """T8-22: Build AggregateValueEntry list from StructuredExtraction results.
+
+    Uses validated field values instead of regex over raw text.
+    """
+    from documind.rag.tools.aggregate_values import AggregateValueEntry
+
+    entries: list[AggregateValueEntry] = []
+    for extraction in extraction_results:
+        if not getattr(extraction, "valid", False):
+            continue
+        fields = getattr(extraction, "fields", {})
+        if not isinstance(fields, dict):
+            continue
+        ext_evidence_ids = getattr(extraction, "evidence_ids", evidence_ids)
+        eid = ext_evidence_ids[0] if ext_evidence_ids else ""
+        for field_name, value in fields.items():
+            if field_name in {"source_spans", "template_id"}:
+                continue
+            if isinstance(value, (int, float)):
+                entries.append(AggregateValueEntry(
+                    value=str(value), unit="", evidence_id=eid, field_name=field_name,
+                ))
+            elif isinstance(value, str):
+                # Try to parse as numeric.
+                cleaned = value.replace(",", "").strip()
+                try:
+                    float(cleaned)
+                    entries.append(AggregateValueEntry(
+                        value=cleaned, unit="", evidence_id=eid, field_name=field_name,
+                    ))
+                except ValueError:
+                    pass
+            elif isinstance(value, dict):
+                # Structured value with amount/unit.
+                amount = value.get("amount") or value.get("value")
+                unit = value.get("unit", "")
+                if amount is not None:
+                    entries.append(AggregateValueEntry(
+                        value=str(amount), unit=str(unit), evidence_id=eid, field_name=field_name,
+                    ))
     return entries

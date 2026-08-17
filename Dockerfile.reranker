@@ -10,6 +10,17 @@ RUN pip install --no-cache-dir \
 # Download and cache the model at build time
 RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3')"
 
+# T7-22: Verify model digest when provided
+ARG RERANKER_MODEL_DIGEST=""
+RUN if [ -n "$RERANKER_MODEL_DIGEST" ]; then \
+        actual=$(find /root/.cache/huggingface/hub/models--BAAI--bge-reranker-v2-m3 -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1); \
+        if [ "$actual" != "$RERANKER_MODEL_DIGEST" ]; then \
+            echo "ERROR: Model digest mismatch. Expected=$RERANKER_MODEL_DIGEST Actual=$actual" >&2; \
+            exit 1; \
+        fi; \
+        echo "Model digest verified: $actual"; \
+    fi
+
 FROM python:3.12-slim
 
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages

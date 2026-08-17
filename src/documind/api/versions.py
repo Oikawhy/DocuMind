@@ -48,25 +48,34 @@ async def reindex_version(
             RebuildProjectionWorkflow,
         )
 
-        # Start rebuild workflows for all three backends scoped to this version
+        # T7-21: Start rebuild workflows for ALL configured backends
         workflow_id = f"reindex-{version_id}"
-        await temporal_client.start_workflow(
-            RebuildProjectionWorkflow.run,
-            RebuildProjectionInput(
-                backend="qdrant",
-                scope="version",
-                scope_id=str(version_id),
-                reason="reindex",
-                requested_by="api",
-            ),
-            id=f"{workflow_id}-qdrant",
-            task_queue=REBUILD_QUEUE,
-        )
+        backends = ["qdrant", "opensearch", "neo4j"]
+        started: list[str] = []
+
+        for backend in backends:
+            try:
+                await temporal_client.start_workflow(
+                    RebuildProjectionWorkflow.run,
+                    RebuildProjectionInput(
+                        backend=backend,
+                        scope="version",
+                        scope_id=str(version_id),
+                        reason="reindex",
+                        requested_by="api",
+                    ),
+                    id=f"{workflow_id}-{backend}",
+                    task_queue=REBUILD_QUEUE,
+                )
+                started.append(backend)
+            except Exception:
+                pass  # Backend may not be configured — skip gracefully
 
         return {
             "version_id": str(version_id),
             "status": "accepted",
             "workflow_id": workflow_id,
+            "backends_started": started,
             "status_url": f"/v1/operations/{workflow_id}",
         }
     except DomainError as exc:

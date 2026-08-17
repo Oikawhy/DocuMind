@@ -1,0 +1,47 @@
+{
+  "comparator:1": {
+    "permitted_role": "QUERY",
+    "revision": 1,
+    "sha256": "f9cadf3ded93f6f1048090d9c98df650ce8d5916de9e715cff187edf7bdc75c3"
+  },
+  "extractor:1": {
+    "permitted_role": "EXTRACT",
+    "revision": 1,
+    "sha256": "bd6776967822da0d0461ed3b6821e457abf38c8fcf3be1ad92df2351c18ec73e"
+  },
+  "generator:1": {
+    "permitted_role": "QUERY",
+    "revision": 1,
+    "sha256": "4ff67372df3b24244fd910d45f0ccdc17d58a8e98b996abb905ee8de5d34fb0a"
+  },
+  "hallucination_grader:1": {
+    "permitted_role": "QUERY",
+    "revision": 1,
+    "sha256": "cdc467b0dd136b1e105974a763809472a4bc36261e4efe84ef6571099cc8f5af"
+  },
+  "planner:1": {
+    "permitted_role": "QUERY",
+    "revision": 1,
+    "sha256": "059bf23b7f26e3b98d34e70a2e84db667e634f98f230089f978fcbe0f400bfe5"
+  },
+  "query_rewriter:1": {
+    "permitted_role": "KEYWORDS",
+    "revision": 1,
+    "sha256": "cadb101561fe7395689dfc5bff9e91ef4394d1de17e6154214b325c445c8832f"
+  },
+  "relevance_grader:1": {
+    "permitted_role": "QUERY",
+    "revision": 1,
+    "sha256": "2adbc129e293691c6cedc8c3fb9c8efee89b82f423bdf41735fc71422d8d8868"
+  },
+  "router:1": {
+    "permitted_role": "KEYWORDS",
+    "revision": 1,
+    "sha256": "9661f9a68b64b5848e0a7ed8496cc9fad1da9d0b8c510f420a0a6023f415245e"
+  },
+  "session_compactor:1": {
+    "permitted_role": "KEYWORDS",
+    "revision": 1,
+    "sha256": "e5ff3a40eb76aff283755438fef09290ee54439e6f68fadac9194b3f0283ac72"
+  }
+}

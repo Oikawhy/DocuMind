@@ -117,6 +117,53 @@ class PromptRegistry:
         """Return all registered template names."""
         return list(self._templates.keys())
 
+    def verify_manifest(self, manifest_path: str | None = None) -> list[str]:
+        """T8-30: Verify all registered templates against a signed manifest.
+
+        Returns a list of error messages (empty if all valid).
+        """
+        import json
+        import os
+
+        if manifest_path is None:
+            manifest_path = os.path.join(
+                os.path.dirname(__file__), "prompt_manifest.json",
+            )
+
+        if not os.path.exists(manifest_path):
+            return []  # No manifest to verify against — pass.
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        errors: list[str] = []
+        for name, revisions in self._templates.items():
+            for rev, template in revisions.items():
+                key = f"{name}:{rev}"
+                expected = manifest.get(key, {}).get("sha256", "")
+                if not expected:
+                    errors.append(f"Template '{key}' not in manifest")
+                elif expected != template.sha256:
+                    errors.append(
+                        f"Template '{key}' hash mismatch: "
+                        f"manifest={expected[:16]}… registered={template.sha256[:16]}…"
+                    )
+        return errors
+
+    @staticmethod
+    def generate_manifest(registry: PromptRegistry) -> dict[str, dict[str, Any]]:
+        """Generate a manifest dict from the current registry state."""
+        manifest: dict[str, dict[str, Any]] = {}
+        for name, revisions in registry._templates.items():
+            for rev, template in revisions.items():
+                key = f"{name}:{rev}"
+                manifest[key] = {
+                    "revision": rev,
+                    "sha256": template.sha256,
+                    "permitted_role": template.permitted_role.value,
+                }
+        return manifest
+
 
 def build_default_registry() -> PromptRegistry:
     """Build a PromptRegistry pre-loaded with all default templates.

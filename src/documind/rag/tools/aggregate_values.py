@@ -27,6 +27,32 @@ _COMPATIBLE_UNITS: dict[str, set[str]] = {
     "time": {"s", "ms", "min", "h", "d"},
 }
 
+# T8-23: Conversion factors to base units.
+_CONVERSION_TO_BASE: dict[str, tuple[str, Decimal]] = {
+    # length → meters
+    "km": ("m", Decimal("1000")),
+    "cm": ("m", Decimal("0.01")),
+    "mm": ("m", Decimal("0.001")),
+    "in": ("m", Decimal("0.0254")),
+    "ft": ("m", Decimal("0.3048")),
+    "yd": ("m", Decimal("0.9144")),
+    "mi": ("m", Decimal("1609.344")),
+    "m": ("m", Decimal("1")),
+    # weight → grams
+    "kg": ("g", Decimal("1000")),
+    "mg": ("g", Decimal("0.001")),
+    "t": ("g", Decimal("1000000")),
+    "lb": ("g", Decimal("453.592")),
+    "oz": ("g", Decimal("28.3495")),
+    "g": ("g", Decimal("1")),
+    # time → seconds
+    "ms": ("s", Decimal("0.001")),
+    "min": ("s", Decimal("60")),
+    "h": ("s", Decimal("3600")),
+    "d": ("s", Decimal("86400")),
+    "s": ("s", Decimal("1")),
+}
+
 
 # ---------------------------------------------------------------------------
 # Versioned input / output schemas
@@ -134,10 +160,18 @@ async def aggregate_values(input_data: AggregateValuesInput) -> AggregateValuesO
                 input_count=len(input_data.values),
                 evidence_ids=[v.evidence_id for v in input_data.values if v.evidence_id],
             )
+
+        # T8-23: Normalize to base unit if conversion exists.
+        unit = entry.unit
+        if unit and unit in _CONVERSION_TO_BASE:
+            base_unit, factor = _CONVERSION_TO_BASE[unit]
+            val = val * factor
+            unit = base_unit
+
         parsed.append(val)
         if entry.evidence_id:
             evidence_ids.append(entry.evidence_id)
-        trace_lines.append(f"  {entry.field_name or 'value'}: {val} {entry.unit} [{entry.evidence_id}]")
+        trace_lines.append(f"  {entry.field_name or 'value'}: {val} {unit} [{entry.evidence_id}]")
 
     if not parsed:
         return AggregateValuesOutput(

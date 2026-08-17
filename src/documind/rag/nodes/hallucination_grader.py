@@ -3,11 +3,13 @@
 Evaluates each claim against supplied evidence.  Produces structured
 unsupported/partial/grounded issues.  Two-revision cap; unsupported
 claims after cap trigger safe abstention.
+
+T8-13: Parse failures and exceptions are fail-closed — they produce
+``all_grounded=False`` and set ``abstention_reason``, not a silent pass.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import structlog
@@ -129,23 +131,26 @@ async def hallucination_grader_node(
     }
 
     try:
-        result = await llm_service.invoke(
-            ModelRole.QUERY, messages, json_schema=output_schema,
+        from documind.rag.invoke_helpers import invoke_with_retry
+
+        parsed, limitation_code = await invoke_with_retry(
+            llm_service, ModelRole.QUERY, messages,
+            output_schema=output_schema,
+            template_name="hallucination_grader",
         )
 
-        if result.structured and result.structured.valid:
-            parsed = result.structured.parsed
-        else:
-            try:
-                parsed = json.loads(result.content)
-            except (json.JSONDecodeError, TypeError):
-                return {
-                    "hallucination_grade": HallucinationGrade(all_grounded=True),
-                    "agent_path": [
-                        *state.get("agent_path", []),
-                        "hallucination:parse_error_pass",
-                    ],
-                }
+        # T8-13: Fail-closed on parse failure after retry.
+        if parsed is None:
+            return {
+                "hallucination_grade": HallucinationGrade(
+                    all_grounded=False, needs_revision=False,
+                ),
+                "abstention_reason": f"Hallucination grader output invalid ({limitation_code})",
+                "agent_path": [
+                    *state.get("agent_path", []),
+                    f"hallucination:parse_error_abstain:{limitation_code}",
+                ],
+            }
 
         issues: list[HallucinationIssue] = []
         for issue_data in parsed.get("issues", []):
@@ -188,8 +193,12 @@ async def hallucination_grader_node(
         return update
 
     except Exception:
+        # T8-13: Fail-closed on exception.
         logger.exception("hallucination_grader_error")
         return {
-            "hallucination_grade": HallucinationGrade(all_grounded=True),
-            "agent_path": [*state.get("agent_path", []), "hallucination:error_pass"],
+            "hallucination_grade": HallucinationGrade(
+                all_grounded=False, needs_revision=False,
+            ),
+            "abstention_reason": "Hallucination grader encountered an error",
+            "agent_path": [*state.get("agent_path", []), "hallucination:error_abstain"],
         }

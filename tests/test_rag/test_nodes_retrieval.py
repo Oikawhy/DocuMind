@@ -63,7 +63,7 @@ class TestRetrievalOrchestrator:
         mock_response.retrieval_metadata.backend_timings = {"qdrant": 50}
         mock_response.retrieval_metadata.candidate_count_before_auth = 10
         mock_response.degraded_branches = []
-        retrieval_service.search = AsyncMock(return_value=mock_response)
+        retrieval_service.retrieve = AsyncMock(return_value=mock_response)
 
         state = _base_state()
         result = await retrieval_orchestrator_node(
@@ -92,7 +92,7 @@ class TestRetrievalOrchestrator:
         from documind.rag.nodes.retrieval_orchestrator import retrieval_orchestrator_node
 
         retrieval_service = AsyncMock()
-        retrieval_service.search = AsyncMock(side_effect=RuntimeError("backend down"))
+        retrieval_service.retrieve = AsyncMock(side_effect=RuntimeError("backend down"))
 
         state = _base_state()
         result = await retrieval_orchestrator_node(
@@ -132,10 +132,16 @@ class TestPermissionGuardNode:
         session_factory.__aexit__ = AsyncMock(return_value=None)
         session_factory_fn = MagicMock(return_value=session_factory)
 
+        # Create mock auth_context.
+        mock_auth_ctx = MagicMock()
+        mock_auth_ctx.session_factory = session_factory_fn
+        mock_auth_ctx.document_ids = frozenset({doc_id})
+        mock_auth_ctx.subject = "test-user"
+
         result = await permission_guard_node(
             state,
+            auth_context=mock_auth_ctx,
             session_factory=session_factory_fn,
-            allowed_document_ids={doc_id},
         )
 
         # All candidates should be filtered since chunks don't exist in DB.
@@ -151,7 +157,6 @@ class TestPermissionGuardNode:
         result = await permission_guard_node(
             state,
             session_factory=AsyncMock(),
-            allowed_document_ids=set(),
         )
 
         assert result["filtered_candidate_ids"] == []

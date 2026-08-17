@@ -92,6 +92,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         minio_secret = await secret_client.get_secret("documind/minio", "secret_key") if secret_client else ""
         cursor_hmac_hex = await secret_client.get_secret("documind/api", "cursor_hmac_key") if secret_client else ""
 
+        # T7-12: Resolve Neo4j secrets BEFORE closing secret_client
+        neo4j_user_resolved = ""
+        neo4j_pass_resolved = ""
+        if settings.neo4j_auth_ref and secret_client is not None:
+            try:
+                neo4j_user_resolved = await secret_client.get_secret("documind/neo4j", "user")
+                neo4j_pass_resolved = await secret_client.get_secret("documind/neo4j", "password")
+            except Exception:
+                logger.warning("neo4j_secret_resolution_failed")
+
         if minio_access and minio_secret and cursor_hmac_hex:
             storage = StorageService.from_resolved_credentials(
                 endpoint=settings.minio_endpoint,
@@ -174,25 +184,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             from documind.services.backends.neo4j_local_backend import Neo4jLocalRetrievalBackend
             from documind.services.backends.neo4j_global_backend import Neo4jGlobalRetrievalBackend
 
-            neo4j_auth_ref = settings.neo4j_auth_ref
-            if neo4j_auth_ref and secret_client is not None:
-                neo4j_user = await secret_client.get_secret("documind/neo4j", "user")
-                neo4j_pass = await secret_client.get_secret("documind/neo4j", "password")
-                auth_tuple: tuple[str, str] | None = (neo4j_user, neo4j_pass) if neo4j_user else None
-            else:
-                auth_tuple = None
+            # T7-12: Use pre-resolved credentials (resolved before secret_client.close())
+            auth_tuple: tuple[str, str] | None = None
+            if neo4j_user_resolved:
+                auth_tuple = (neo4j_user_resolved, neo4j_pass_resolved)
+
+            # T7-09: Inject ActiveGenerationManager for verified generation lookup
+            from documind.services.generation_manager import ActiveGenerationManager
+            generation_manager = ActiveGenerationManager(session_factory=app.state.session_factory)
 
             neo4j_driver = AsyncGraphDatabase.driver(settings.neo4j_uri, auth=auth_tuple)
             backends["neo4j_local"] = Neo4jLocalRetrievalBackend(
                 driver=neo4j_driver,
                 max_hops=settings.neo4j_max_hops_local,
+                generation_manager=generation_manager,
             )
             backends["neo4j_global"] = Neo4jGlobalRetrievalBackend(
                 driver=neo4j_driver,
                 max_sources=settings.neo4j_max_sources_global,
+                generation_manager=generation_manager,
             )
         except Exception:
             logger.warning("neo4j_backends_unavailable")
+
 
         if backends:
             app.state.retrieval_service = RetrievalService(

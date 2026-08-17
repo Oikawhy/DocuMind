@@ -172,12 +172,15 @@ async def test_post_reindex_returns_accepted(client: AsyncClient) -> None:
     identity = AsyncMock()
     identity.validate_oidc_token.return_value = _principal()
     doc_service = AsyncMock()
+    temporal_client = AsyncMock()
     original_doc_service = app.state.document_service
     original_identity = app.state.identity_service
+    original_temporal = getattr(app.state, "temporal_client", None)
     version_id = uuid.uuid4()
     try:
         app.state.document_service = doc_service
         app.state.identity_service = identity
+        app.state.temporal_client = temporal_client
         response = await client.post(
             f"/v1/document-versions/{version_id}/reindex",
             headers={"Authorization": "Bearer test"},
@@ -185,11 +188,16 @@ async def test_post_reindex_returns_accepted(client: AsyncClient) -> None:
     finally:
         app.state.document_service = original_doc_service
         app.state.identity_service = original_identity
+        if original_temporal is not None:
+            app.state.temporal_client = original_temporal
 
     assert response.status_code == 202
     data = response.json()
     assert data["version_id"] == str(version_id)
     assert data["status"] == "accepted"
+    # T7-21: Should have dispatched for all three backends
+    assert "backends_started" in data
+
 
 
 async def test_post_retrieval_empty_query_returns_422(client: AsyncClient) -> None:

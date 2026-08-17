@@ -44,8 +44,18 @@ async def extractor_node(
 
     reranked_ids = state.get("reranked_evidence_ids", [])
 
+    # T8-17: Resolve template_revision_id from plan steps.
+    template_revision_id = None
+    for step in state.get("plan", []):
+        if hasattr(step, "operation") and step.operation == "extract_structured":
+            template_revision_id = getattr(step, "template_revision_id", None)
+            break
+        elif isinstance(step, dict) and step.get("operation") == "extract_structured":
+            template_revision_id = step.get("template_revision_id")
+            break
+
     input_data = ExtractStructuredInput(
-        template_revision_id=None,  # Will be resolved by the template loader
+        template_revision_id=template_revision_id,
         evidence_ids=reranked_ids,
     )
 
@@ -54,6 +64,7 @@ async def extractor_node(
         llm_service=llm_service,
         evidence_cache=evidence_cache,
         template_loader=template_loader,
+        prompt_registry=prompt_registry,
     )
 
     extraction = StructuredExtraction(

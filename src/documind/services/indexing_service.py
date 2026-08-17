@@ -155,13 +155,19 @@ class QdrantProjectionWriter:
                 id=payload.chunk_id,
                 vector=payload.embedding,
                 payload={
+                    "chunk_id": payload.chunk_id,
                     "version_id": payload.version_id,
                     "document_id": payload.document_id,
+                    "content": payload.content,
                     "content_hash": payload.content_hash,
+                    "content_sha256": payload.content_hash,
                     "profile_revision": payload.profile_revision,
                     "label_ids": payload.label_ids,
                     "lifecycle": payload.lifecycle,
                     "tombstone_generation": payload.tombstone_generation,
+                    "page_start": payload.page_start,
+                    "page_end": payload.page_end,
+                    "section_path": payload.section_path or [],
                     "text_hash": hashlib.sha256(payload.content.encode("utf-8")).hexdigest(),
                 },
             )
@@ -251,6 +257,7 @@ _OPENSEARCH_INDEX_SETTINGS: dict[str, Any] = {
     },
     "mappings": {
         "properties": {
+            "chunk_id": {"type": "keyword"},
             "content": {
                 "type": "text",
                 "analyzer": "text_analyzer",
@@ -264,6 +271,7 @@ _OPENSEARCH_INDEX_SETTINGS: dict[str, Any] = {
             "lifecycle": {"type": "keyword"},
             "tombstone_generation": {"type": "long"},
             "content_hash": {"type": "keyword"},
+            "content_sha256": {"type": "keyword"},
             "profile_revision": {"type": "keyword"},
             "declared_type": {"type": "keyword"},
             "locale": {"type": "keyword"},
@@ -346,10 +354,12 @@ class OpenSearchProjectionWriter:
             action = json.dumps({"index": {"_id": payload.chunk_id}})
             doc = json.dumps(
                 {
+                    "chunk_id": payload.chunk_id,
                     "content": payload.content,
                     "document_id": payload.document_id,
                     "version_id": payload.version_id,
                     "content_hash": payload.content_hash,
+                    "content_sha256": payload.content_hash,
                     "profile_revision": payload.profile_revision,
                     "label_ids": payload.label_ids,
                     "lifecycle": payload.lifecycle,

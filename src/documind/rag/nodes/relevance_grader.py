@@ -7,7 +7,6 @@ abstain).  Validates that referenced evidence IDs exist in the authorized set.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import structlog
@@ -116,15 +115,19 @@ async def relevance_grader_node(
     }
 
     try:
-        result = await llm_service.invoke(ModelRole.QUERY, messages, json_schema=output_schema)
+        from documind.rag.invoke_helpers import invoke_with_retry
 
-        if result.structured and result.structured.valid:
-            parsed = result.structured.parsed
-        else:
-            try:
-                parsed = json.loads(result.content)
-            except (json.JSONDecodeError, TypeError):
-                return _abstain_fallback(state, "Invalid grader output")
+        parsed, limitation_code = await invoke_with_retry(
+            llm_service, ModelRole.QUERY, messages,
+            output_schema=output_schema,
+            template_name="relevance_grader",
+        )
+
+        # T8-15: Fail-closed on parse failure after retry.
+        if parsed is None:
+            return _abstain_fallback(
+                state, f"Relevance grader output invalid ({limitation_code})",
+            )
 
         raw_grades = parsed.get("grades", [])
         request_kind = parsed.get("request_kind", "abstain")
@@ -157,6 +160,10 @@ async def relevance_grader_node(
         return {
             "relevance_grades": validated_grades,
             "relevance_request_kind": request_kind,
+            # T8-10: Increment targeted_expansions counter.
+            **({
+                "targeted_expansions": state.get("targeted_expansions", 0) + 1,
+            } if request_kind == "targeted_expansion" else {}),
             "agent_path": [
                 *state.get("agent_path", []),
                 f"grader:{request_kind}:{len(validated_grades)}_graded",
@@ -185,6 +192,11 @@ def _enforce_loop_guards(
 
     if request_kind == "targeted_expansion" and targeted_expansions >= MAX_TARGETED_EXPANSIONS:
         logger.info("grader_max_expansion_reached", expansions=targeted_expansions)
+        return "abstain"
+
+    # T8-15: Reject unknown request kinds — fail-closed.
+    if request_kind not in {"answer", "rewrite", "targeted_expansion", "abstain"}:
+        logger.warning("grader_unknown_request_kind", kind=request_kind)
         return "abstain"
 
     return request_kind

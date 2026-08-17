@@ -18,6 +18,15 @@ from documind.services.retrieval_service import AuthorizationContext, RetrievalB
 logger = structlog.get_logger(__name__)
 
 
+class DenseEmbedder(Protocol):
+    """Produce a dense vector for a single query."""
+
+    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+    @property
+    def dimension(self) -> int: ...
+
+
 class QdrantAsyncClient(Protocol):
     """Subset of qdrant-client async API used for retrieval search."""
 
@@ -48,10 +57,12 @@ class QdrantRetrievalBackend:
         client: Any,
         collection: str = "documind_chunks",
         embedding_dim: int = 1024,
+        embedder: Any | None = None,
     ) -> None:
         self._client = client
         self._collection = collection
         self._embedding_dim = embedding_dim
+        self._embedder = embedder
 
     @property
     def name(self) -> str:
@@ -87,29 +98,46 @@ class QdrantRetrievalBackend:
 
         # Build Qdrant payload filter
         version_id_strs = [str(vid) for vid in context.allowed_version_ids]
-        query_filter = Filter(
-            must=[
+        must_conditions = [
+            FieldCondition(
+                key="version_id",
+                match=MatchAny(any=version_id_strs),
+            ),
+            FieldCondition(
+                key="lifecycle",
+                match=MatchValue(value="completed"),
+            ),
+            FieldCondition(
+                key="tombstone_generation",
+                match=MatchValue(value=0),
+            ),
+        ]
+        # T7-04: Enforce allowed-label constraint from authorization context
+        if context.allowed_label_ids:
+            label_id_strs = [str(lid) for lid in context.allowed_label_ids]
+            must_conditions.append(
                 FieldCondition(
-                    key="version_id",
-                    match=MatchAny(any=version_id_strs),
-                ),
-                FieldCondition(
-                    key="lifecycle",
-                    match=MatchValue(value="completed"),
-                ),
-                FieldCondition(
-                    key="tombstone_generation",
-                    match=MatchValue(value=0),
-                ),
-            ]
-        )
+                    key="label_ids",
+                    match=MatchAny(any=label_id_strs),
+                )
+            )
+        query_filter = Filter(must=must_conditions)
 
         async def _do_search() -> list[ScoredChunk]:
-            # For now, use a scroll with filter (text-based retrieval
-            # fallback). Dense vector search requires the query to be
-            # pre-embedded by the orchestrator.
+            # Use dense vector search when an embedder is available
+            if self._embedder is not None:
+                try:
+                    vectors = await self._embedder.embed([query])
+                    query_vector = vectors[0]
+                except Exception as exc:
+                    await logger.awarning("qdrant_embedding_failed", error=str(exc))
+                    query_vector = None
+            else:
+                query_vector = None
+
             results = await self._client.search(
                 collection_name=self._collection,
+                query_vector=query_vector,
                 query_filter=query_filter,
                 limit=max_candidates,
                 with_payload=True,
@@ -131,12 +159,16 @@ class QdrantRetrievalBackend:
         for result in results:
             payload = getattr(result, "payload", {}) or {}
             try:
+                content_sha256 = str(
+                    payload.get("content_sha256")
+                    or payload.get("content_hash", "")
+                )
                 chunk = ScoredChunk(
                     chunk_id=uuid.UUID(str(payload.get("chunk_id", result.id))),
                     version_id=uuid.UUID(str(payload["version_id"])),
                     document_id=uuid.UUID(str(payload["document_id"])),
                     content=str(payload.get("content", "")),
-                    content_sha256=str(payload.get("content_sha256", "")),
+                    content_sha256=content_sha256,
                     page_start=payload.get("page_start"),
                     page_end=payload.get("page_end"),
                     section_path=payload.get("section_path", []),
@@ -145,7 +177,7 @@ class QdrantRetrievalBackend:
                 )
                 # Validate required fields
                 if not chunk.content_sha256:
-                    await logger.awarning(
+                    logger.warning(
                         "qdrant_chunk_missing_hash",
                         chunk_id=str(chunk.chunk_id),
                     )

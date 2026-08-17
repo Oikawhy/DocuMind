@@ -262,6 +262,36 @@ EXTRACTOR_PROMPT = _with_hash(PromptTemplate(
     permitted_role=ModelRole.EXTRACT,
     max_input_tokens=4096,
     max_output_tokens=4096,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "json_schema": {"type": "object"},
+            "field_dictionary": {"type": "object"},
+        },
+        "required": ["evidence", "json_schema"],
+    },
+    output_schema={
+        "type": "object",
+        "properties": {
+            "fields": {"type": "object"},
+            "source_spans": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "evidence_id": {"type": "string"},
+                            "text": {"type": "string"},
+                        },
+                        "required": ["evidence_id", "text"],
+                    },
+                },
+            },
+        },
+        "required": ["fields"],
+    },
     text=(
         "You are a structured data extractor. Extract data from the provided "
         "evidence according to the JSON Schema supplied in the system prompt. "
@@ -287,6 +317,31 @@ COMPARATOR_PROMPT = _with_hash(PromptTemplate(
     permitted_role=ModelRole.QUERY,
     max_input_tokens=4096,
     max_output_tokens=2048,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "differences": {"type": "array", "items": {"type": "object"}},
+        },
+        "required": ["differences"],
+    },
+    output_schema={
+        "type": "object",
+        "properties": {
+            "claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim_id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["claim_id", "text", "evidence_ids"],
+                },
+            },
+        },
+        "required": ["claims"],
+    },
     text=(
         "You are a document comparison analyst. Given deterministic diff "
         "results between two document versions, express meaningful changes "
@@ -411,6 +466,30 @@ SESSION_COMPACTOR_PROMPT = _with_hash(PromptTemplate(
     permitted_role=ModelRole.KEYWORDS,
     max_input_tokens=4096,
     max_output_tokens=256,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "messages": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["role", "content"],
+                },
+            },
+        },
+        "required": ["messages"],
+    },
+    output_schema={
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "maxLength": 2000},
+        },
+        "required": ["summary"],
+    },
     text=(
         "Summarize this conversation history concisely. Focus on:\n"
         "- Key topics discussed\n"

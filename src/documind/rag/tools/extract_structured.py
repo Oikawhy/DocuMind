@@ -50,11 +50,12 @@ async def extract_structured(
     llm_service: Any,
     evidence_cache: Any,
     template_loader: Any | None = None,
+    prompt_registry: Any | None = None,
 ) -> ExtractStructuredOutput:
     """Extract structured data using an approved template and the EXTRACT role.
 
-    If no active template exists, returns ``pending_template=True`` without
-    persisting an approved structured result.
+    T8-18: Uses registered EXTRACTOR_PROMPT via prompt_registry + wrap_with_safety.
+    T8-19: Validates source span text against evidence content.
     """
     from documind.services.llm_service import ModelRole
 
@@ -86,10 +87,28 @@ async def extract_structured(
     template_schema = template.get("json_schema", {}) if isinstance(template, dict) else {}
     field_dict = template.get("field_dictionary", {}) if isinstance(template, dict) else {}
 
-    system_prompt = (
-        "You are a structured data extractor. Extract data from the provided evidence "
-        "according to the JSON Schema below. For each populated field, provide source spans "
-        "(exact quotes from the evidence). Return valid JSON matching the schema.\n\n"
+    # T8-18: Use registered template + safety wrapper.
+    from documind.rag.prompts.safety import wrap_with_safety
+
+    if prompt_registry is not None:
+        try:
+            registered = prompt_registry.resolve("extractor")
+            base_prompt = registered.text
+        except KeyError:
+            base_prompt = (
+                "You are a structured data extractor. Extract data from the provided evidence "
+                "according to the JSON Schema below. For each populated field, provide source spans "
+                "(exact quotes from the evidence). Return valid JSON matching the schema."
+            )
+    else:
+        base_prompt = (
+            "You are a structured data extractor. Extract data from the provided evidence "
+            "according to the JSON Schema below. For each populated field, provide source spans "
+            "(exact quotes from the evidence). Return valid JSON matching the schema."
+        )
+
+    system_prompt = wrap_with_safety(
+        f"{base_prompt}\n\n"
         f"JSON Schema:\n```json\n{json.dumps(template_schema, indent=2)}\n```\n\n"
         f"Field Dictionary:\n```json\n{json.dumps(field_dict, indent=2)}\n```"
     )
@@ -132,6 +151,14 @@ async def extract_structured(
                             validation_errors.append(
                                 f"Field '{field_name}' references unknown evidence ID: {ref_eid}"
                             )
+                        # T8-19: Validate span text against evidence content.
+                        span_text = span.get("text", "")
+                        if span_text and ref_eid and evidence_cache:
+                            evidence_content = evidence_cache.get(ref_eid) if not evidence_cache.is_expired else None
+                            if evidence_content and span_text not in evidence_content:
+                                validation_errors.append(
+                                    f"Field '{field_name}' span text not found in evidence {ref_eid}"
+                                )
 
         return ExtractStructuredOutput(
             extraction=parsed,

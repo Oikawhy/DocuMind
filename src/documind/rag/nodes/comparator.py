@@ -58,7 +58,12 @@ async def comparator_node(
         right_version_id=right.version_id,
         evidence_ids=reranked_ids,
     )
-    diff_result = await compare_versions(input_data, evidence_cache)
+
+    # T8-20: Build evidence_metadata from state.
+    evidence_metadata = state.get("evidence_version_metadata", {})
+    diff_result = await compare_versions(
+        input_data, evidence_cache, evidence_metadata=evidence_metadata,
+    )
 
     # Generate prose claims via QUERY role.
     claims: list[Claim] = []
@@ -85,29 +90,57 @@ async def comparator_node(
             {"role": "user", "content": f"Differences:\n{diff_summary}"},
         ]
 
+        # T8-21: Output schema for structured claim generation.
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "claims": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "claim_id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["claim_id", "text", "evidence_ids"],
+                    },
+                },
+            },
+            "required": ["claims"],
+        }
+
         try:
-            result = await llm_service.invoke(ModelRole.QUERY, messages)
-            # Parse claims from prose result.
-            try:
-                parsed = json.loads(result.content) if not (
-                    result.structured and result.structured.valid
-                ) else result.structured.parsed
-                raw_claims = parsed.get("claims", []) if isinstance(parsed, dict) else []
-                for i, claim_data in enumerate(raw_claims):
-                    claims.append(
-                        Claim(
-                            claim_id=claim_data.get("claim_id", f"comp_claim_{i}"),
-                            text=claim_data.get("text", ""),
-                            evidence_ids=claim_data.get("evidence_ids", []),
-                        )
-                    )
-            except (json.JSONDecodeError, TypeError):
-                # Prose output — create a single claim from the text.
+            from documind.rag.invoke_helpers import invoke_with_retry
+
+            parsed, limitation_code = await invoke_with_retry(
+                llm_service, ModelRole.QUERY, messages,
+                output_schema=output_schema,
+                template_name="comparator",
+            )
+
+            if parsed is None:
+                # T8-21: Fail-closed on parse failure.
+                return {
+                    "comparison_result": None,
+                    "abstention_reason": f"Comparator output invalid ({limitation_code})",
+                    "agent_path": [
+                        *state.get("agent_path", []),
+                        f"comparator:parse_error_abstain:{limitation_code}",
+                    ],
+                }
+
+            raw_claims = parsed.get("claims", []) if isinstance(parsed, dict) else []
+            authorized_ids = set(reranked_ids)
+            for i, claim_data in enumerate(raw_claims):
+                # T8-21: Validate evidence_ids against authorized set.
+                claim_eids = claim_data.get("evidence_ids", [])
+                valid_eids = [e for e in claim_eids if e in authorized_ids]
                 claims.append(
                     Claim(
-                        claim_id="comp_claim_0",
-                        text=result.content[:2000],
-                        evidence_ids=reranked_ids,
+                        claim_id=claim_data.get("claim_id", f"comp_claim_{i}"),
+                        text=claim_data.get("text", ""),
+                        evidence_ids=valid_eids,
                     )
                 )
         except Exception:

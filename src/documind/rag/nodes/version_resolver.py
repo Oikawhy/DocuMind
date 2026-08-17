@@ -39,11 +39,13 @@ async def version_resolver_node(
     # Collect version selectors from the plan.
     selectors: list[VersionSelector] = []
     for step in plan:
-        if step.document_selector and step.version_selector:
+        if step.document_selector:
+            # T8-25: Default to latest_completed when version_selector absent.
+            version_sel = step.version_selector or "latest_completed"
             selectors.append(
                 VersionSelector(
                     document_id=step.document_selector,
-                    selector=step.version_selector,
+                    selector=version_sel,
                 )
             )
 

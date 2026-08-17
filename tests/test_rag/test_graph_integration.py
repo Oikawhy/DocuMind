@@ -135,9 +135,13 @@ class TestRAGServiceTimeout:
         svc_mod.RUNTIME_BUDGET_SECONDS = 0.1
 
         try:
+            mock_auth_ctx = MagicMock()
+            mock_auth_ctx.subject = "user@example.com"
+            mock_auth_ctx.document_ids = frozenset()
+
             response = await service.run_rag_query(
                 question="Test question",
-                principal_subject="user@example.com",
+                auth_context=mock_auth_ctx,
             )
 
             assert response.abstained is True
@@ -162,9 +166,13 @@ class TestRAGServiceError:
             session_factory=AsyncMock(),
         )
 
+        mock_auth_ctx = MagicMock()
+        mock_auth_ctx.subject = "user@example.com"
+        mock_auth_ctx.document_ids = frozenset()
+
         response = await service.run_rag_query(
             question="Test question",
-            principal_subject="user@example.com",
+            auth_context=mock_auth_ctx,
         )
 
         assert response.abstained is True

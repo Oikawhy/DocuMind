@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from documind.models.document import DocumentVersion
+from documind.models.document import Document, DocumentVersion
 from documind.models.enums import DocumentLifecycle
 from documind.models.label import DeletionTombstone
 from documind.rag.state import VersionRef
@@ -82,7 +82,27 @@ async def resolve_versions(
             )
             continue
 
-        doc_uuid = uuid.UUID(doc_id)
+        # T8-24: Try UUID parse first, fall back to title resolution.
+        try:
+            doc_uuid = uuid.UUID(doc_id)
+        except ValueError:
+            name_stmt = select(Document).where(
+                Document.title == doc_id,
+            )
+            name_result = await session.execute(name_stmt)
+            doc_row = name_result.scalar_one_or_none()
+            if doc_row is None:
+                results.append(
+                    VersionRef(
+                        document_id=doc_id,
+                        version_id="",
+                        version_number=0,
+                        selector_used=selector.selector,
+                        status="failed",
+                    ).__dict__
+                )
+                continue
+            doc_uuid = doc_row.id
 
         # Check for deletion tombstone.
         tombstone_stmt = select(DeletionTombstone).where(
@@ -132,12 +152,26 @@ async def _resolve_latest_completed(
     session: AsyncSession,
     doc_uuid: uuid.UUID,
 ) -> VersionRef | None:
-    """Resolve to the latest completed, non-erased version."""
+    """Resolve to the latest completed, non-tombstoned version.
+
+    T8-26: Filters out tombstoned versions (tombstone_generation != 0)
+    and erased documents (erased_at IS NOT NULL).
+    """
+    # Check document is not erased.
+    doc_stmt = select(Document).where(
+        Document.id == doc_uuid,
+        Document.erased_at.is_(None),
+    )
+    doc_result = await session.execute(doc_stmt)
+    if doc_result.scalar_one_or_none() is None:
+        return None
+
     stmt = (
         select(DocumentVersion)
         .where(
             DocumentVersion.document_id == doc_uuid,
             DocumentVersion.lifecycle == DocumentLifecycle.COMPLETED,
+            DocumentVersion.tombstone_generation == 0,  # T8-26
         )
         .order_by(DocumentVersion.version_number.desc())
         .limit(1)
@@ -160,7 +194,10 @@ async def _resolve_explicit_version(
     doc_uuid: uuid.UUID,
     selector: str,
 ) -> VersionRef | None:
-    """Resolve an explicit version number like 'v3' or '3'."""
+    """Resolve an explicit version number like 'v3' or '3'.
+
+    T8-26: Returns 'erased' status for tombstoned versions.
+    """
     try:
         version_number = int(selector.lstrip("v"))
     except ValueError:
@@ -174,6 +211,16 @@ async def _resolve_explicit_version(
     version = result.scalar_one_or_none()
     if version is None:
         return None
+
+    # T8-26: Check for tombstoned version.
+    if version.tombstone_generation != 0:
+        return VersionRef(
+            document_id=str(doc_uuid),
+            version_id=str(version.id),
+            version_number=version.version_number,
+            selector_used=selector,
+            status="erased",
+        )
 
     if version.lifecycle == DocumentLifecycle.COMPLETED:
         status: str = "resolved"
@@ -198,7 +245,8 @@ async def _resolve_date_range(
 ) -> VersionRef | None:
     """Resolve versions within a date range (e.g. '2025-01-01..2025-06-30').
 
-    Returns the latest completed version within the range.
+    Returns the latest completed, non-tombstoned version within the range.
+    T8-26: Filters out tombstoned versions.
     """
     from datetime import datetime
 
@@ -217,6 +265,7 @@ async def _resolve_date_range(
         .where(
             DocumentVersion.document_id == doc_uuid,
             DocumentVersion.lifecycle == DocumentLifecycle.COMPLETED,
+            DocumentVersion.tombstone_generation == 0,  # T8-26
             DocumentVersion.created_at >= start_date,
             DocumentVersion.created_at <= end_date,
         )
