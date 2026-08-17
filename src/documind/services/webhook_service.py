@@ -61,14 +61,15 @@ class WebhookService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def validate_target_url(url: str) -> str:
+    def validate_target_url(url: str) -> tuple[str, str]:
         """Validate a webhook URL against SSRF rules.
 
         Requirements (§9.5):
         - HTTPS required
         - DNS resolution through controlled resolver
         - Reject loopback, private, link-local, and reserved addresses
-        - Return the resolved IP for pinning
+
+        T9-10: Returns ``(url, resolved_ip)`` for DNS pinning.
         """
         if not url.startswith("https://"):
             raise SSRFViolationError("Webhook target URL must use HTTPS.")
@@ -93,6 +94,7 @@ class WebhookService:
         if not addr_infos:
             raise SSRFViolationError(f"No DNS records found for {hostname}.")
 
+        resolved_ip: str | None = None
         for addr_info in addr_infos:
             ip_str = addr_info[4][0]
             try:
@@ -111,7 +113,11 @@ class WebhookService:
             if ip.is_multicast:
                 raise SSRFViolationError("Multicast addresses are not permitted.")
 
-        return url
+            if resolved_ip is None:
+                resolved_ip = ip_str
+
+        assert resolved_ip is not None  # guaranteed by non-empty addr_infos
+        return url, resolved_ip
 
     # ------------------------------------------------------------------
     # HMAC signature
@@ -242,15 +248,31 @@ class WebhookService:
         state = "failed"
 
         try:
-            async with httpx.AsyncClient(timeout=_DELIVERY_TIMEOUT) as client:
+            # T9-10: Re-resolve DNS and pin to resolved IP for each delivery.
+            _, resolved_ip = self.validate_target_url(str(webhook.target_url))
+            parsed_url = httpx.URL(str(webhook.target_url))
+            port = parsed_url.port or 443
+
+            async with httpx.AsyncClient(
+                timeout=_DELIVERY_TIMEOUT,
+                transport=httpx.AsyncHTTPTransport(
+                    local_address=None,
+                ),
+            ) as client:
+                # Pin the request to the resolved IP while keeping SNI/Host correct.
+                pinned_url = str(webhook.target_url).replace(
+                    f"://{parsed_url.host}", f"://{resolved_ip}", 1
+                )
                 response = await client.post(
-                    str(webhook.target_url),
+                    pinned_url,
                     content=body,
                     headers={
                         "Content-Type": "application/cloudevents+json",
                         "X-DocuMind-Signature": signature,
                         "X-DocuMind-Timestamp": str(timestamp),
+                        "Host": str(parsed_url.host),
                     },
+                    extensions={"sni_hostname": str(parsed_url.host)},
                 )
                 http_status = response.status_code
                 if 200 <= http_status < 300:

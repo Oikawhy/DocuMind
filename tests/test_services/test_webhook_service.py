@@ -66,7 +66,7 @@ class TestSSRFValidation:
             (2, 1, 6, "", ("93.184.216.34", 0)),
         ]
         result = WebhookService.validate_target_url("https://example.com/hook")
-        assert result == "https://example.com/hook"
+        assert result == ("https://example.com/hook", "93.184.216.34")
 
     @patch("documind.services.webhook_service.socket.getaddrinfo")
     def test_rejects_dns_failure(self, mock_dns: MagicMock) -> None:
@@ -168,7 +168,7 @@ class TestSecretStorage:
         service = WebhookService(session_factory=mock_factory)
         raw_secret = "my-super-secret-webhook-key-here!"
 
-        with patch.object(WebhookService, "validate_target_url", return_value="https://example.com/hook"):
+        with patch.object(WebhookService, "validate_target_url", return_value=("https://example.com/hook", "93.184.216.34")):
             webhook = await service.register_webhook(
                 target_url="https://example.com/hook",
                 event_type_glob="*",

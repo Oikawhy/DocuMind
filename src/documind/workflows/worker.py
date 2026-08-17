@@ -41,6 +41,7 @@ from documind.workflows.maintenance.outbox_dispatcher import (
     RedisStreamWorkflowRunner,
     TemporalWorkflowConsumer,
 )
+from documind.services.webhook_dispatcher import WebhookDispatcher
 from documind.workflows.stage_store import (
     PostgresChunkProfileSource,
     PostgresNormalizedDocumentSource,
@@ -81,6 +82,8 @@ class IngestionWorkerRuntime:
     project_gpu_worker: Worker | None = None
     project_cpu_worker: Worker | None = None
     rebuild_worker: Worker | None = None
+    # T9-13: Optional webhook dispatcher for outbox-event-driven delivery.
+    webhook_dispatcher: WebhookDispatcher | None = None
 
     async def run(self, shutdown: asyncio.Event) -> None:
         """Run all workers, the outbox dispatcher, and the Redis consumer together until shutdown."""
@@ -113,6 +116,12 @@ class IngestionWorkerRuntime:
                 await self.dispatcher.dispatch_once(limit=100)
             except Exception:
                 logger.exception("outbox_dispatch_error")
+            # T9-13: Dispatch webhooks for consumed outbox events.
+            if self.webhook_dispatcher is not None:
+                try:
+                    await self.webhook_dispatcher.process_pending_events(limit=50)
+                except Exception:
+                    logger.exception("webhook_dispatch_error")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(shutdown.wait(), timeout=2.0)
 

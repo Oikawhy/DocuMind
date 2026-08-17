@@ -61,6 +61,38 @@ class SecretService:
             await logger.ainfo("openbao_secret_retrieved", path=path)
             return str(value)
 
+    async def put_secret(self, path: str, data: dict[str, str]) -> None:
+        """Write secret data to an OpenBao KV v2 secret.
+
+        T9-11: Used to provision webhook HMAC secrets at registration time.
+
+        Args:
+            path: Secret path relative to the ``secret/`` mount
+                  (e.g. ``documind/webhooks/{id}``).
+            data: Key-value pairs to store.
+
+        Raises:
+            SecretRetrievalError: On any network or auth failure.
+        """
+        url = f"/v1/secret/data/{path}"
+        try:
+            resp = await self._client.post(url, json={"data": data})
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            await logger.aerror(
+                "openbao_secret_write_http_error",
+                path=path,
+                status=exc.response.status_code,
+            )
+            raise SecretRetrievalError(
+                f"OpenBao returned HTTP {exc.response.status_code} writing path '{path}'."
+            ) from exc
+        except httpx.RequestError as exc:
+            await logger.aerror("openbao_secret_write_error", path=path, error=str(exc))
+            raise SecretRetrievalError(f"Failed to write secret at path '{path}'.") from exc
+        else:
+            await logger.ainfo("openbao_secret_written", path=path)
+
     async def close(self) -> None:
         """Shut down the underlying HTTP client."""
         await self._client.aclose()
