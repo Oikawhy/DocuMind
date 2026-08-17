@@ -647,11 +647,22 @@ async def delete_session(
     request: Request,
     session_id: uuid.UUID,
 ) -> JSONResponse | None:
-    """Erase a chat session with audit."""
+    """Erase a chat session with mandatory audit evidence.
+
+    T9-06: Audit is required for erasure operations. The request fails
+    with 503 if the audit service is unavailable.
+    """
     try:
         principal = _principal(request)
         sf = _session_factory(request)
         audit = _audit_service(request)
+
+        # T9-06: Mandatory audit for erasure operations.
+        if audit is None:
+            raise DomainError(
+                "Audit service is unavailable; erasure operations require audit evidence.",
+                code="DEPENDENCY_UNAVAILABLE",
+            )
 
         async with sf() as session, session.begin():
             stmt = select(ChatSession).where(
@@ -663,6 +674,17 @@ async def delete_session(
             if chat_session is None:
                 raise ResourceNotFoundError("Chat session not found.", code="SESSION_NOT_FOUND")
 
+            # Write audit BEFORE deletion (within transaction scope).
+            await audit.write_event(
+                AuditEntry(
+                    actor_subject=principal.subject,
+                    action="chat.session.erased",
+                    resource_type="chat_session",
+                    resource_id=str(session_id),
+                    details={"subject": chat_session.subject},
+                )
+            )
+
             # Delete agent runs, then messages, then session.
             await session.execute(
                 delete(AgentRun).where(AgentRun.session_id == session_id)
@@ -671,16 +693,6 @@ async def delete_session(
                 delete(ChatMessage).where(ChatMessage.session_id == session_id)
             )
             await session.delete(chat_session)
-
-        if audit is not None:
-            await audit.write_event(
-                AuditEntry(
-                    actor_subject=principal.subject,
-                    action="chat.session.deleted",
-                    resource_type="chat_session",
-                    resource_id=str(session_id),
-                )
-            )
 
         return None
     except DomainError as exc:
